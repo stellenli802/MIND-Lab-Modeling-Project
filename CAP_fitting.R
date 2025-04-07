@@ -2,12 +2,12 @@ setwd("~/Desktop/MindLabWork")
 library(tidyverse)
 library(survival)
 
-toydata <- readRDS("toy_data.rds")
+toydata <- readRDS("toydata.rds")
 # Full equation consists of interaction term: Age0 +CAG+(Age0×CAG)
 aft_full <- survreg(Surv(W, delta) ~ age_0 * allele2l, data = toydata, dist = "loglogistic") 
 summary(aft_full)
 
-# I am also fitting this model based ont the CAP score and CAP-scaled score.
+# I am also fitting this model based on the CAP score and CAP-scaled score.
 toydata$CAP <- toydata$age_0 * (toydata$allele2l - 33.66)
 
 # Fit AFT model using CAP
