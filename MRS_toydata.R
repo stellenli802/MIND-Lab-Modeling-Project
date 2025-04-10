@@ -13,5 +13,3 @@ toydata$diagconf <- factor(toydata$diagconf, levels = c("DCL1", "DCL2", "DCL3"),
 model_MRS <- coxph(Surv(W, delta) ~ diagconf + motscore + I(motscore^2) + scnt1 + swrt1
                    + sit1 + sdmt1 + allele2l + age_0 + allele2l:motscore + allele2l:age_0, data=toydata)
 summary(model_MRS)
-
-test test test
