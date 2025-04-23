@@ -3,8 +3,8 @@ library(tidyverse)
 library(survival)
 
 toydata <- readRDS("toydata.rds")
-# Full equation consists of interaction term: Age0 +CAG+(Age0×CAG)
-aft_full <- survreg(Surv(W, delta) ~ age_0 * allele2l, data = toydata, dist = "loglogistic") 
+# Full equation consists of interaction term: Age0 + (Age0:CAG)
+aft_full <- survreg(Surv(W, delta) ~ age_0 + age_0:allele2l, data = toydata, dist = "loglogistic") 
 summary(aft_full)
 
 # I am also fitting this model based on the CAP score and CAP-scaled score.
