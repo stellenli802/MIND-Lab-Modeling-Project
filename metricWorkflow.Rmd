@@ -1,0 +1,248 @@
+---
+title: "Metric Workflow"
+author: "Abby Foes"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(survival)
+library(ggplot2)
+library(dplyr)
+library(pec)
+
+setwd("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models")
+source("metric_functions.R")
+source("Langbehn_functions.R")
+```
+
+```{r datasets}
+## Load analytic dataset
+ENROLL <- readRDS("enrollhd_baseline_survival_data.rds")
+
+## Data transformations
+ENROLL = ENROLL %>%
+  mutate(CAP = age_0 * (CAG - 34))
+
+## Create "clean" datasets (complete cases)
+# Data for Langbehn model
+Langbehn_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "CAG", "age_0")]), ] %>%
+  mutate(W_age = age_0 + W)
+
+# Data for CAP model
+CAP_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "CAG", "age_0")]), ] %>%
+  filter(W != 0)
+
+# Data for MRS model
+MRS_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "diagconf", "motscore", 
+                                                       "scnt1", "swrt1", "sit1", "sdmt1", "CAG", "age_0")]), ] %>%
+  filter(W != 0) %>%
+  mutate(motscore2 = motscore^2)
+
+# Data for PI model
+PI_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "motscore", "sdmt1", "CAG", "age_0")]), ] %>%
+  filter(W != 0)
+
+# PI_HD = 51*ENROLL$motscore + (-34)*ENROLL$sdmt1 + 7*ENROLL$CAP
+# PIN <- (PI_HD - 883)/1044
+# CAP_data$CAPs <- CAP_data$CAP / ( (CAP$coefficients[1]) - log(5) / ( -1 * CAP$coefficients[2] ) ) # requires CAP model below to be run for this line
+```
+
+```{r Langbehn_model}
+## Fit each of the four models of interest
+### Langbehn model
+# Example of MLE for Langbehn model
+# starting values taken from Langbehn et al (2004) parameter estimates
+start_vals <- c(21.54, 9.56, 0.146, 35.55, 17.72, 0.327)
+
+# Step 1: Coarse optimization via Nelder-Mead
+langbehn_NM <- optim(
+  par = start_vals,
+  fn = function(p) {
+    -Langbehn_LogLik(
+      params = p,
+      age = Langbehn_data_clean$W_age,
+      cag = Langbehn_data_clean$CAG,
+      status = Langbehn_data_clean$delta
+    )
+  },
+  method = "Nelder-Mead",
+  control = list(maxit = 1000, reltol = 1e-10)
+)
+
+# Step 2: Gradient-based refinement via BFGS
+langbehn_BFGS <- optim(
+  par = langbehn_NM$par,
+  fn = function(p) {
+    -Langbehn_LogLik(
+      params = p,
+      age = Langbehn_data_clean$W_age,
+      cag = Langbehn_data_clean$CAG,
+      status = Langbehn_data_clean$delta
+    )
+  },
+  method = "BFGS",
+  control = list(maxit = 1000, reltol = 1e-10),
+  hessian = TRUE
+)
+
+```
+
+```{r CAP_MRS_PIN_models}
+### PIN model
+# PI_model <- coxph(formula = Surv(W, delta) ~ motscore + sdmt1 + CAP, 
+#                    data=ENROLL)
+PI_model_clean <- coxph(formula = Surv(W, delta) ~ motscore + sdmt1 + CAP, 
+                   data=PI_data_clean, x=TRUE)
+
+### MRS model
+# MRS_model <- coxph(formula = Surv(W, delta) ~ diagconf + motscore + motscore2 + 
+#                      scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 + 
+#                      CAG:motscore + CAG:age_0, 
+#                      data=MRS_data)
+MRS_model_clean <- coxph(formula = Surv(W, delta) ~ diagconf + motscore + motscore2 + 
+                     scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 + 
+                     CAG:motscore + CAG:age_0, 
+                   data=MRS_data_clean, x=TRUE)
+### CAP model
+CAP_model_clean <- survreg(formula = Surv(W, delta) ~ age_0 + CAG:age_0,
+                     data = CAP_data_clean, dist = "loglogistic")
+# CAPs_model      <- survreg(formula = Surv(W, delta) ~ CAPs,
+#                      data = CAP_data, dist = "loglogistic")
+```
+
+## Calibration Plots
+```{r calplots}
+## For each model, do the following
+
+# Langbehn model
+# get_langbehn_calibration_data(params = langbehn_BFGS$par, 
+#                               data = Langbehn_data_clean,
+#                               t_stars = c(5), 
+#                               n_bins = 10)
+
+# CAP model
+CAP_cal_data <- getCalibrationData(fit = CAP_model_clean,
+                                   times = c(1, 3, 5),
+                                   data = CAP_data_clean,
+                                   method = "quantile",
+                                   q = 10,
+                                   model_name = "CAP")
+
+# MRS model
+MRS_cal_data <- getCalibrationData(fit = MRS_model_clean,
+                               times = c(1, 3, 5),
+                               data = MRS_data_clean,
+                               method = "quantile",
+                               q = 10,
+                               model_name = "MRS")
+
+# PI model
+PI_cal_data <- getCalibrationData(fit = PI_model_clean,
+                                 times = c(1, 3, 5),
+                                 data = PI_data_clean,
+                                 method = "quantile",
+                                 q = 10,
+                                 model_name = "PI")
+
+# plot all models
+plotCalibrationGG(rbind(CAP_cal_data, 
+                        MRS_cal_data, PI_cal_data), color_by = "time", facet_by = "model") +
+  theme_bw()
+```
+
+## ROC and AUC
+```{r roc}
+## For each model, do the following
+
+# CAP model
+CAP_roc_data <- getSurvivalROCdata(fit = CAP_model_clean,
+                                   times = c(1,3,5),
+                                   data = CAP_data_clean,
+                                   time_col = "W",
+                                   status_col = "delta",
+                                   model_name = "CAP")
+
+# MRS model
+MRS_roc_data <- getSurvivalROCdata(fit = MRS_model_clean,
+                                   times = c(1,3,5),
+                                   data = MRS_data_clean,
+                                   time_col = "W",
+                                   status_col = "delta",
+                                   model_name = "MRS")
+
+# PI model
+PI_roc_data <- getSurvivalROCdata(fit = PI_model_clean,
+                                  times = c(1,3,5),
+                                  data = PI_data_clean,
+                                  time_col = "W",
+                                  status_col = "delta",
+                                  model_name = "PI")
+
+# plot all models
+plotSurvivalROCgg(rbind(CAP_roc_data, MRS_roc_data, PI_roc_data)) +
+  theme_bw()
+```
+
+## Brier and Integrated Brier Scores
+```{r brier}
+## For each model, do the following
+
+pec_obj <- getBrierScore(fit = MRS_clean,
+                         data = MRS_data_clean,
+                         formula = Surv(W, delta) ~ diagconf + motscore + 
+                                                    motscore2 + scnt1 + swrt1 + 
+                                                    sit1 + sdmt1 + CAG + age_0 + 
+                                                    CAG:motscore + CAG:age_0,
+                         times = c(1, 3, 5))
+
+brier_summary <- extractBrierSummary(pec_obj)
+
+# Print IBS
+brier_summary$ibs
+
+# Plot Brier score over time
+brier_summary$brier_scores %>%
+  ggplot(aes(x = time, y = brier, color = model)) +
+  geom_line(size = 1.1) +
+  labs(title = "Brier Score Over Time", y = "Brier Score") +
+  theme_minimal()
+```
+
+## Harrell's C Index
+```{r harrellC}
+## For each model, do the following
+
+# CAP model
+getHarrellC(fit = CAP_model_clean, data = CAP_data_clean, time_col = "W", status_col = "delta")
+
+# MRS model
+getHarrellC(fit = MRS_model_clean, data = MRS_data_clean, time_col = "W", status_col = "delta")
+
+# PI model
+getHarrellC(fit = PI_model_clean, data = PI_data_clean, time_col = "W", status_col = "delta")
+```
+
+```{r UnoC}
+# CAP model
+CAP_UnoC <- getUnoC_multiple_times(fit = CAP_model_clean, data = CAP_data_clean, time_col = "W", status_col = "delta", 
+                                   t_star_vec = c(1,2,3,8), model_name = "CAP")
+
+# MRS model
+MRS_UnoC <- getUnoC_multiple_times(fit = MRS_model_clean, data = MRS_data_clean, time_col = "W", status_col = "delta", 
+                                   t_star = c(1,2,3), model_name = "MRS")
+
+# PI model
+PI_UnoC <- getUnoC_multiple_times(fit = PI_model_clean, data = PI_data_clean, time_col = "W", status_col = "delta", 
+                                  t_star = c(1,2,3), model_name = "PI")
+PI_data_clean$W %>% table()
+rbind(CAP_UnoC, MRS_UnoC, PI_UnoC)
+
+table(CAP_data_clean$delta, CAP_data_clean$W)
+
+table(MRS_data_clean$delta, MRS_data_clean$W)
+
+table(PI_data_clean$delta, PI_data_clean$W)
+```
