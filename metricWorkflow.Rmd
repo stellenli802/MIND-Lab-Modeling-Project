@@ -12,15 +12,17 @@ library(survival)
 library(ggplot2)
 library(dplyr)
 library(pec)
+library(purrr)
+library(tibble)
 
-setwd("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models")
+setwd("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project")
 source("metric_functions.R")
 source("Langbehn_functions.R")
 ```
 
 ```{r datasets}
 ## Load analytic dataset
-ENROLL <- readRDS("enrollhd_baseline_survival_data.rds")
+ENROLL <- readRDS("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/enrollhd_baseline_survival_data.rds")
 
 ## Data transformations
 ENROLL = ENROLL %>%
@@ -33,21 +35,21 @@ Langbehn_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "CAG", "ag
 
 # Data for CAP model
 CAP_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "CAG", "age_0")]), ] %>%
-  filter(W != 0)
+  filter(W != 0) # removing subjects with no follow-up at all
 
 # Data for MRS model
 MRS_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "diagconf", "motscore", 
                                                        "scnt1", "swrt1", "sit1", "sdmt1", "CAG", "age_0")]), ] %>%
-  filter(W != 0) %>%
+  filter(W != 0) %>% # removing subjects with no follow-up at all
   mutate(motscore2 = motscore^2)
 
 # Data for PI model
 PI_data_clean <- ENROLL[complete.cases(ENROLL[, c("W", "delta", "motscore", "sdmt1", "CAG", "age_0")]), ] %>%
-  filter(W != 0)
+  filter(W != 0) # removing subjects with no follow-up at all
 
-# PI_HD = 51*ENROLL$motscore + (-34)*ENROLL$sdmt1 + 7*ENROLL$CAP
-# PIN <- (PI_HD - 883)/1044
-# CAP_data$CAPs <- CAP_data$CAP / ( (CAP$coefficients[1]) - log(5) / ( -1 * CAP$coefficients[2] ) ) # requires CAP model below to be run for this line
+PI_HD = 51*ENROLL$motscore + (-34)*ENROLL$sdmt1 + 7*ENROLL$CAP
+PIN <- (PI_HD - 883)/1044
+CAP_data_clean$CAPs <- CAP_data_clean$CAP / ( (CAP_model_clean$coefficients[1]) - log(5) / ( -1 * CAP_model_clean$coefficients[2] ) ) # requires CAP model below to be run for this line
 ```
 
 ```{r Langbehn_model}
@@ -90,10 +92,12 @@ langbehn_BFGS <- optim(
 
 ```
 
+## Model Definitions
 ```{r CAP_MRS_PIN_models}
 ### PIN model
 # PI_model <- coxph(formula = Surv(W, delta) ~ motscore + sdmt1 + CAP, 
 #                    data=ENROLL)
+PIN_formula <- Surv(W, delta) ~ motscore + sdmt1 + CAP
 PI_model_clean <- coxph(formula = Surv(W, delta) ~ motscore + sdmt1 + CAP, 
                    data=PI_data_clean, x=TRUE)
 
@@ -102,11 +106,13 @@ PI_model_clean <- coxph(formula = Surv(W, delta) ~ motscore + sdmt1 + CAP,
 #                      scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 + 
 #                      CAG:motscore + CAG:age_0, 
 #                      data=MRS_data)
+MRS_formula <- Surv(W, delta) ~ diagconf + motscore + motscore2 + scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0
 MRS_model_clean <- coxph(formula = Surv(W, delta) ~ diagconf + motscore + motscore2 + 
                      scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 + 
                      CAG:motscore + CAG:age_0, 
                    data=MRS_data_clean, x=TRUE)
 ### CAP model
+CAP_formula <- Surv(W, delta) ~ age_0 + CAG + CAG:age_0
 CAP_model_clean <- survreg(formula = Surv(W, delta) ~ age_0 + CAG:age_0,
                      data = CAP_data_clean, dist = "loglogistic")
 # CAPs_model      <- survreg(formula = Surv(W, delta) ~ CAPs,
@@ -114,7 +120,7 @@ CAP_model_clean <- survreg(formula = Surv(W, delta) ~ age_0 + CAG:age_0,
 ```
 
 ## Calibration Plots
-```{r calplots}
+```{r calplots, warnings = FALSE}
 ## For each model, do the following
 
 # Langbehn model
@@ -190,25 +196,36 @@ plotSurvivalROCgg(rbind(CAP_roc_data, MRS_roc_data, PI_roc_data)) +
 ```{r brier}
 ## For each model, do the following
 
-pec_obj <- getBrierScore(fit = MRS_clean,
+# MRS
+pec_mrs <- getBrierScore(fit = MRS_model_clean,
                          data = MRS_data_clean,
-                         formula = Surv(W, delta) ~ diagconf + motscore + 
-                                                    motscore2 + scnt1 + swrt1 + 
-                                                    sit1 + sdmt1 + CAG + age_0 + 
-                                                    CAG:motscore + CAG:age_0,
+                         formula = MRS_formula,
                          times = c(1, 3, 5))
 
-brier_summary <- extractBrierSummary(pec_obj)
+mrs_summary <- extractBrierSummary(pec_mrs)
 
-# Print IBS
-brier_summary$ibs
+# PIN
+pec_pin <- getBrierScore(fit = PI_model_clean,
+                         data = PI_data_clean,
+                         formula = PIN_formula,
+                         times = c(1, 3, 5))
+pin_summary <- extractBrierSummary(pec_pin)
 
-# Plot Brier score over time
-brier_summary$brier_scores %>%
-  ggplot(aes(x = time, y = brier, color = model)) +
-  geom_line(size = 1.1) +
-  labs(title = "Brier Score Over Time", y = "Brier Score") +
-  theme_minimal()
+# CAP
+pec_cap <- getBrierScore(fit = CAP_model_clean,
+                         data = CAP_data_clean,
+                         formula = CAP_formula,
+                         times = c(1, 3, 5))
+cap_summary <- extractBrierSummary(pec_cap)
+
+
+# Plot all summaries
+summaries <- list(
+  MRS = mrs_summary,
+  PIN = pin_summary,
+  CAP = cap_summary)
+plotBrierSummaries(summaries)
+
 ```
 
 ## Harrell's C Index

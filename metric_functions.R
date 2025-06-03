@@ -1,7 +1,19 @@
-library(pec)
 
-# allows the function pec::predictSurvProb to work on survreg objects
+#' predictSurvProb.survreg
+#'
+#' allows the function pec::predictSurvProb to work on survreg objects
+#'
+#' @param object 
+#' @param newdata 
+#' @param times 
+#' @param ... 
+#'
+#' @return
+#' @export
+#'
+#' @examples
 predictSurvProb.survreg <- function(object, newdata, times, ...) {
+  stopifnot(requireNamespace("pec", quietly = TRUE))
   lp <- predict(object, newdata = newdata, type = "lp")
   scale <- object$scale
   dist <- object$dist
@@ -356,4 +368,59 @@ extractBrierSummary <- function(pec_obj) {
     brier_scores = brier_df,
     ibs = ibs_vals
   )
+}
+
+#' Plot Brier Scores Over Time with IBS Labels
+#'
+#' Takes a named list of model Brier score summaries (output from `extractBrierSummary()`)
+#' and returns a ggplot object with one line per model, labeled with its Integrated Brier Score (IBS).
+#'
+#' @param summaries A named list of `extractBrierSummary()` outputs (one per model).
+#'
+#' @return A ggplot object showing Brier score curves and IBS-labeled legend.
+#' @export
+#'
+#' @examples
+#' summaries <- list(
+#'   MRS = extractBrierSummary(getBrierScore(...)),
+#'   CAP = extractBrierSummary(getBrierScore(...))
+#' )
+#' plotBrierSummaries(summaries)
+plotBrierSummaries <- function(summaries) {
+  # Step 1: Extract IBS values and build labels
+  ibs_df <- purrr::map2_dfr(summaries, names(summaries), function(model_list, model_name) {
+    ibs_mat <- model_list$ibs
+    model_labels <- rownames(ibs_mat)
+    
+    method_row <- which(model_labels != "Reference")[1]
+    method_name <- model_labels[method_row]
+    ibs_value <- ibs_mat[method_row, 1]
+    
+    tibble(
+      model_name = model_name,
+      method = method_name,
+      ibs = ibs_value,
+      label = paste0(model_name, " (IBS = ", round(ibs_value, 3), ")")
+    )
+  })
+  
+  # Step 2: Combine all brier_scores and join IBS labels
+  all_scores <- purrr::map2_dfr(summaries, names(summaries), function(model_list, model_name) {
+    bs <- model_list$brier_scores
+    bs$model_name <- model_name
+    bs
+  }) %>%
+    dplyr::filter(model != "Reference") %>%
+    dplyr::left_join(ibs_df, by = "model_name")
+  
+  # Step 3: Plot with IBS in the legend
+  ggplot(all_scores, aes(x = time, y = brier, color = label, linetype = model)) +
+    geom_line(size = 1.2) +
+    labs(
+      title = "Brier Score Over Time",
+      y = "Brier Score",
+      x = "Time (Years)",
+      color = "Model (with IBS)"
+    ) +
+    theme_minimal()
 }
