@@ -1,0 +1,352 @@
+---
+title: "Cross-Validation-Metrics"
+author: "Kyle Grosser"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(survival)
+library(pec)
+library(rsample)
+library(survAUC)
+
+source("metric_functions.R")
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Data Preprocessing
+
+```{r load-and-filter-data}
+## Load analytic dataset
+ENROLL <- readRDS("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/enrollhd_baseline_survival_data.rds")
+
+enroll_filt <- ENROLL %>%
+  ungroup() %>%
+  filter(W != 0) %>%
+  filter(complete.cases(select(., W, delta, CAG, age_0,
+                               diagconf, motscore, scnt1, swrt1,
+                               sit1, sdmt1))) %>%
+  mutate(
+    W_age = age_0 + W,
+    motscore2 = motscore^2,
+    CAP = age_0 * (CAG - 34)
+  )
+
+dim(enroll_filt)
+
+1 - mean(enroll_filt$delta)
+```
+
+After pre-processing, our sample consisted of 5722 patients. We then filtered out patients with values of $W=0$ since these patients have no follow-up time. This first filtering step resulted in a sample of 4496 patients. We then filtered our dataset to have complete cases on the "union" of all covariates for each model. We filtered in this way so that our metrics were computed on the same sample for each model, and to keep the cross-validation procedure simple and interpretable. This complete case filtering procedure retains $n = 4155$ patients with all variables required for the CAP, MRS, and PI models.
+
+---
+
+## 2. 5-Fold Cross-Validation for Harrell's C Index
+
+```{r harrell-c-index}
+set.seed(2024)
+folds <- vfold_cv(enroll_filt, v = 5)
+
+C_index_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data  <- assessment(split)
+
+  CAP_model <- survreg(Surv(W, delta) ~ age_0 + CAG:age_0,
+                       data = train_data, dist = "loglogistic")
+  CAP_Harrell_C <- getHarrellC(fit = CAP_model, data = test_data)
+
+  MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
+                       scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
+                       CAG:motscore + CAG:age_0,
+                     data = train_data, x = TRUE)
+  MRS_Harrell_C <- getHarrellC(fit = MRS_model, data = test_data)
+
+  PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
+                    data = train_data, x = TRUE)
+  PI_Harrell_C <- getHarrellC(fit = PI_model, data = test_data)
+
+  tibble(
+    fold = i,
+    model = c("CAP", "MRS", "PI"),
+    c_index = c(CAP_Harrell_C, MRS_Harrell_C, PI_Harrell_C)
+  )
+})
+
+C_index_summary <- C_index_results %>%
+  group_by(model) %>%
+  summarize(mean_c = mean(c_index), sd_c = sd(c_index), .groups = "drop")
+
+print(C_index_summary)
+```
+
+Harrell's C index measures agreement between the ranking of patients by observed time to diagnosis and the ranking of patients by risk score (in reverse). Values close to 1 indicate strong agreement and values below 0.5 indicate poor performance. All of the mean Harrell's C for each model are below 0.2, indicating very poor performance. However, Harrell's C is known to be biased when censoring is high, which is the case in our sample (nearly 80% censoring).
+
+---
+
+## 3. Calibration Plots from 5-Fold CV
+
+```{r calibration-data, include = F, cache = T}
+CV_calibration_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data  <- assessment(split)
+
+  CAP_model <- survreg(Surv(W, delta) ~ age_0 + CAG:age_0,
+                       data = train_data, dist = "loglogistic")
+  MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
+                       scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
+                       CAG:motscore + CAG:age_0,
+                     data = train_data, x = TRUE)
+  PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
+                    data = train_data, x = TRUE)
+
+  CAP_cal_data <- getCalibrationData(CAP_model, 1:5, test_data, "quantile", q=10, "CAP")
+  MRS_cal_data <- getCalibrationData(MRS_model, 1:5, test_data, "quantile", q=10, "MRS")
+  PI_cal_data  <- getCalibrationData(PI_model,  1:5, test_data, "quantile", q=10, "PI")
+
+  CAP_cal_data$fold <- MRS_cal_data$fold <- PI_cal_data$fold <- i
+  rbind(CAP_cal_data, MRS_cal_data, PI_cal_data)
+})
+```
+
+```{r calibration-plots, fig.width = 10, fig.height = 6}
+ggplot(CV_calibration_results, aes(x = Pred, y = Obs)) +
+  geom_line(aes(group = fold), color = "black", alpha = 0.3) +
+  geom_line(stat = "smooth", method = "loess", color = "blue", se = FALSE) +
+  facet_grid(model ~ time, labeller = label_both) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "Predicted Risk", y = "Observed Proportion",
+       title = "Pooled 5-Fold Calibration Curves") +
+  theme_minimal()
+
+
+## facet by time, stack by model - pooled only, not plotting each fold
+ggplot(CV_calibration_results, aes(x = Pred, y = Obs, color = as.factor(model))) +
+  geom_line(aes(group = interaction(fold, model)), color = "black", alpha = 0) +
+  geom_smooth(method = "loess", size = 1.1, se = FALSE) +
+  facet_wrap(~time, nrow = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "Predicted Risk", y = "Observed Proportion",
+       title = "Pooled 5-Fold Calibration Curves", color = "Model") +
+  theme_minimal() +
+  coord_fixed(ratio = 1)
+```
+
+In these plots, we facet by model (rows) and time horizon (columns). The first column ($t = 1$) shows how well each model predicts diagnosis within 1 year. A model demonstrates strong calibration if its results lie close to the line $y=x$ (the identity line). The grey lines indicate the performance of individual testing sets, while the blue lines indicates pooled performance. At $t=1$ and $t=2$, the MRS and PI models perform well. At $t=3$, $t=4$, and $t=5$, the CAP and MRS models perform well. Overall, the MRS model performs well across all horizons considered.
+
+---
+
+## 4. Time-Dependent ROC Curves
+
+```{r roc-curves, cache = T}
+CV_ROC_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data  <- assessment(split)
+
+  CAP_model <- survreg(Surv(W, delta) ~ age_0 + CAG:age_0,
+                       data = train_data, dist = "loglogistic")
+  MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
+                       scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
+                       CAG:motscore + CAG:age_0,
+                     data = train_data, x = TRUE)
+  PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
+                    data = train_data, x = TRUE)
+
+  CAP_roc <- getSurvivalROCdata(CAP_model, 1:8, test_data, "W", "delta", "CAP")
+  MRS_roc <- getSurvivalROCdata(MRS_model, 1:8, test_data, "W", "delta", "MRS")
+  PI_roc  <- getSurvivalROCdata(PI_model,  1:8, test_data, "W", "delta", "PI")
+
+  CAP_roc$fold <- MRS_roc$fold <- PI_roc$fold <- i
+  bind_rows(CAP_roc, MRS_roc, PI_roc)
+})
+```
+
+```{r roc-curves-results, fig.width=20, fig.height = 20}
+ggplot(CV_ROC_results, aes(x = FPR, y = TPR)) +
+  geom_line(aes(group = fold), alpha = 0.3, color = "gray") +
+  geom_line(stat = "smooth", method = "loess", se = FALSE, color = "blue") +
+  facet_grid(model ~ time, labeller = label_both) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "False Positive Rate", y = "True Positive Rate",
+       title = "Time-dependent ROC Curves: Pooled 5-Fold CV") +
+  theme_minimal()
+
+AUC_summary <- CV_ROC_results %>%
+  group_by(model, time, fold) %>%
+  summarize(AUC = unique(AUC)) %>%
+  group_by(model, time) %>%
+  summarize(mean_AUC = mean(AUC), sd_AUC = sd(AUC), .groups = "drop")
+
+print(AUC_summary)
+
+## facet by time - overlay by model, AUC in legend
+
+# create df with labels for each pooled plot with AUC values in ()
+AUC_labels <- CV_ROC_results %>%
+  left_join(AUC_summary, by = c("model", "time")) %>%
+  mutate(model_label = paste0(model, " (AUC = ", round(mean_AUC, 3), ")"))
+
+# generate list of ggplots
+plot_list <- AUC_labels %>%
+  split(.$time) %>%
+  map(~{
+    ggplot(.x, aes(x = FPR, y = TPR, color = as.factor(model_label))) +
+      geom_line(aes(group = interaction(fold, model_label)), alpha = 0) +
+      geom_smooth(se = FALSE, method = "loess", size = 1.1) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+      coord_fixed(ratio = 1) +
+      xlim(0, 1) + ylim(0, 1) +
+      labs(
+        title = paste0("Calibration at Time ", unique(.x$time)),
+        x = "Predicted Risk",
+        y = "Observed Proportion",
+        color = "Model (AUC)"
+      ) +
+      theme_minimal()
+  })
+
+# print list of ggplots
+library(patchwork)
+wrap_plots(plot_list, ncol = 2)  # adjust as needed
+
+```
+
+Time-dependent receiver operating characteristic (ROC) curves demonstrate a model's discriminative ability for individual time points. To summarise these curves, we calculate the area under the curve (AUC). AUC values near 1 indicate strong performance, while values close to 0 indicate poor performance. The CAP and PI models produce AUC values between 77 and 81, whereas the MRS model produces values between 85 and 87. Overall, these results indicate that the MRS model best distinguishes between patients who will be diagnosed by time $t$ and those who will not for all values of $t$ considered.
+
+---
+
+## 5. Time-dependent, IPCW-based ROC curves
+
+```{r IPCW-roc-curves}
+CV_UnoC_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data  <- assessment(split)
+
+  # Fit models on training data
+  CAP_model <- survreg(Surv(W, delta) ~ age_0 + CAG:age_0,
+                       data = train_data, dist = "loglogistic")
+  MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
+                       scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
+                       CAG:motscore + CAG:age_0,
+                     data = train_data, x = TRUE)
+  PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
+                    data = train_data, x = TRUE)
+
+  t_stars <- 1:8
+  surv_obj <- Surv(test_data$W, test_data$delta)
+
+  # Linear predictors (negate for AFT)
+  lp_CAP <- -predict(CAP_model, newdata = test_data, type = "lp")
+  lp_MRS <- predict(MRS_model, newdata = test_data, type = "lp")
+  lp_PI  <- predict(PI_model,  newdata = test_data, type = "lp")
+
+  # Time-specific Uno's C
+  time_specific <- map_dfr(t_stars, function(t_star) {
+    tibble(
+      fold = i,
+      time = t_star,
+      CAP = AUC.uno(surv_obj, surv_obj, lp_CAP, times = t_star)$iauc,
+      MRS = AUC.uno(surv_obj, surv_obj, lp_MRS, times = t_star)$iauc,
+      PI  = AUC.uno(surv_obj, surv_obj, lp_PI,  times = t_star)$iauc
+    )
+  })
+
+  # Global Uno's C (same fold, all t_stars)
+  global <- tibble(
+    fold = i,
+    time = NA,  # use NA to indicate this is global
+    CAP = AUC.uno(surv_obj, surv_obj, lp_CAP, times = t_stars)$iauc,
+    MRS = AUC.uno(surv_obj, surv_obj, lp_MRS, times = t_stars)$iauc,
+    PI  = AUC.uno(surv_obj, surv_obj, lp_PI,  times = t_stars)$iauc
+  )
+
+  bind_rows(time_specific, global)
+}) %>%
+  pivot_longer(cols = c(CAP, MRS, PI), names_to = "model", values_to = "UnoC")
+```
+
+```{r IPCW-roc-curve-results}
+# Summary table
+UnoC_summary <- CV_UnoC_results %>%
+  mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
+  group_by(model, type, time) %>%
+  summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop")
+
+print(UnoC_summary)
+
+# Compute global UnoC summaries for use in legend
+global_labels <- CV_UnoC_results %>%
+  filter(is.na(time)) %>%
+  group_by(model) %>%
+  summarize(mean_iAUC = mean(UnoC), .groups = "drop") %>%
+  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
+
+# Create named vector for legend renaming
+model_labels <- deframe(global_labels[, c("model", "label")])
+
+# Plot only time-specific points (exclude global)
+CV_UnoC_results %>%
+  filter(!is.na(time)) %>%
+  ggplot(aes(x = time, y = UnoC, color = model)) +
+  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
+  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels) +
+  labs(
+    x = "Time (t*)",
+    y = "Uno's C",
+    title = "IPCW-AUC (Uno's C) Across 5-Fold CV",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## 6. Brier score
+
+```{r Brier-score}
+times_eval <- 1:8
+
+CV_brier_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data <- assessment(split)
+
+  # CAP_formula <- Surv(W, delta) ~ age_0 + CAG:age_0
+  MRS_formula <- Surv(W, delta) ~ diagconf + motscore + motscore2 +
+    scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
+    CAG:motscore + CAG:age_0
+  PI_formula <- Surv(W, delta) ~ motscore + sdmt1 + CAP
+
+  # CAP_model <- survreg(CAP_formula, data = train_data, dist = "loglogistic")
+  MRS_model <- coxph(MRS_formula, data = train_data, x = TRUE)
+  PI_model  <- coxph(PI_formula, data = train_data, x = TRUE)
+
+  # CAP_brier <- extractBrierSummary(getBrierScore(CAP_model, test_data, CAP_formula, times_eval))$brier_scores %>%
+    # mutate(model = "CAP", fold = i)
+
+  MRS_brier <- extractBrierSummary(getBrierScore(MRS_model, test_data, MRS_formula, times_eval))$brier_scores %>%
+    mutate(model = "MRS", fold = i)
+
+  PI_brier <- extractBrierSummary(getBrierScore(PI_model, test_data, PI_formula, times_eval))$brier_scores %>%
+    mutate(model = "PI", fold = i)
+
+  bind_rows(# CAP_brier,
+            MRS_brier, PI_brier)
+})
+
+brier_summary_grouped <- CV_brier_results %>%
+  group_by(model, time) %>%
+  summarize(mean_brier = mean(brier),
+            sd_brier = sd(brier),
+            .groups = "drop")
+
+print(brier_summary_grouped)
+```
