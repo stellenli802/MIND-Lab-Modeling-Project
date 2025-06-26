@@ -1,7 +1,7 @@
 ---
 title: "Cross-Validation-Metrics"
 author: "Kyle Grosser"
-date: "`r Sys.Date()`"
+date: "2025-06-04"
 output: pdf_document
 ---
 
@@ -12,8 +12,8 @@ library(pec)
 library(rsample)
 library(survAUC)
 
-source("metric_functions.R")
-
+source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/metric_functions.R")
+source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/Langbehn_functions.R")
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
@@ -21,26 +21,29 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 ```{r load-and-filter-data}
 ## Load analytic dataset
-ENROLL <- readRDS("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/enrollhd_baseline_survival_data.rds")
+ENROLL <- readRDS("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/enrollhd_baseline_survival_data.rds") %>%
+  ungroup()
 
-enroll_filt <- ENROLL %>%
-  ungroup() %>%
+all_models_data_complete <- ENROLL %>%
   filter(W != 0) %>%
   filter(complete.cases(select(., W, delta, CAG, age_0,
                                diagconf, motscore, scnt1, swrt1,
                                sit1, sdmt1))) %>%
+  filter(CAG > 40 & CAG < 57) %>%
   mutate(
     W_age = age_0 + W,
     motscore2 = motscore^2,
     CAP = age_0 * (CAG - 34)
   )
 
-dim(enroll_filt)
+dim(all_models_data_complete)
 
-1 - mean(enroll_filt$delta)
+1 - mean(all_models_data_complete$delta)
 ```
 
-After pre-processing, our sample consisted of 5722 patients. We then filtered out patients with values of $W=0$ since these patients have no follow-up time. This first filtering step resulted in a sample of 4496 patients. We then filtered our dataset to have complete cases on the "union" of all covariates for each model. We filtered in this way so that our metrics were computed on the same sample for each model, and to keep the cross-validation procedure simple and interpretable. This complete case filtering procedure retains $n = 4155$ patients with all variables required for the CAP, MRS, and PI models.
+After pre-processing, our sample consisted of 5722 patients. We then filtered out patients with values of $W=0$ since these patients have no follow-up time. This first filtering step resulted in a sample of 4496 patients. We then filtered our dataset to have complete cases on the "union" of all covariates for each model. We filtered in this way so that our metrics were computed on the same sample for each model, and to keep the cross-validation procedure simple and interpretable. This complete case filtering procedure retains $4155$ patients with all variables required for the Langbehn, CAP, MRS, and PI models.
+
+Lastly, we restricted our data to only include patients with CAG repeat lengths in the range $[41, 56]$ to match the work done in the Langbehn paper. This step reduced our sample size to $n = 3113$, which is a reduction of about $25%$. However, it is important to note that only $4$ of these patients were removed because their CAG repeat length was $>56$, while the remaining 1038 of those removed had a CAG repeat length $<41$. This particular range of CAG repeat lengths, $[36, 40]$, actually represents patients whose genotype is only partially penetrant; it could be argued that for a preventative clinical trial, it would be ideal to only recruit patients whose genotype is fully penetrant, since they are guaranteed to eventually reach the threshold for a clinical diagnosis whereas those in the partially penetrant range are not.
 
 ---
 
@@ -48,9 +51,13 @@ After pre-processing, our sample consisted of 5722 patients. We then filtered ou
 
 ```{r harrell-c-index}
 set.seed(2024)
-folds <- vfold_cv(enroll_filt, v = 5)
+folds <- vfold_cv(all_models_data_complete, v = 5)
 
-C_index_results <- map_dfr(1:5, function(i) {
+# Preallocate output
+fitted_models_by_fold <- vector("list", length = 5)
+c_index_list <- list()
+
+for (i in 1:5) {
   split <- folds$splits[[i]]
   train_data <- analysis(split)
   test_data  <- assessment(split)
@@ -69,12 +76,29 @@ C_index_results <- map_dfr(1:5, function(i) {
                     data = train_data, x = TRUE)
   PI_Harrell_C <- getHarrellC(fit = PI_model, data = test_data)
 
-  tibble(
-    fold = i,
-    model = c("CAP", "MRS", "PI"),
-    c_index = c(CAP_Harrell_C, MRS_Harrell_C, PI_Harrell_C)
+  Langbehn_params <- fit_langbehn_model(train_data, verbose = FALSE)
+
+  # Optional: Compute C for Langbehn if convergence succeeded
+  # Langbehn_Harrell_C <- getHarrellC(fit = Langbehn_params, data = test_data, model_type = "langbehn")
+
+  # Store models
+  fitted_models_by_fold[[i]] <- list(
+    CAP = CAP_model,
+    MRS = MRS_model,
+    PI = PI_model,
+    Langbehn = Langbehn_params
   )
-})
+
+  c_index_list[[i]] <- tibble(
+    fold = i,
+    model = c("CAP", "MRS", "PI"),  # Add "Langbehn" if included above
+    c_index = c(CAP_Harrell_C, MRS_Harrell_C, PI_Harrell_C)  # , Langbehn_Harrell_C
+  )
+}
+
+# Combine results
+C_index_results <- bind_rows(c_index_list)
+
 
 C_index_summary <- C_index_results %>%
   group_by(model) %>%
@@ -113,7 +137,7 @@ CV_calibration_results <- map_dfr(1:5, function(i) {
 })
 ```
 
-```{r calibration-plots, fig.width = 10, fig.height = 6}
+```{r calibration-plots}
 ggplot(CV_calibration_results, aes(x = Pred, y = Obs)) +
   geom_line(aes(group = fold), color = "black", alpha = 0.3) +
   geom_line(stat = "smooth", method = "loess", color = "blue", se = FALSE) +
@@ -122,18 +146,6 @@ ggplot(CV_calibration_results, aes(x = Pred, y = Obs)) +
   labs(x = "Predicted Risk", y = "Observed Proportion",
        title = "Pooled 5-Fold Calibration Curves") +
   theme_minimal()
-
-
-## facet by time, stack by model - pooled only, not plotting each fold
-ggplot(CV_calibration_results, aes(x = Pred, y = Obs, color = as.factor(model))) +
-  geom_line(aes(group = interaction(fold, model)), color = "black", alpha = 0) +
-  geom_smooth(method = "loess", size = 1.1, se = FALSE) +
-  facet_wrap(~time, nrow = 1) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
-  labs(x = "Predicted Risk", y = "Observed Proportion",
-       title = "Pooled 5-Fold Calibration Curves", color = "Model") +
-  theme_minimal() +
-  coord_fixed(ratio = 1)
 ```
 
 In these plots, we facet by model (rows) and time horizon (columns). The first column ($t = 1$) shows how well each model predicts diagnosis within 1 year. A model demonstrates strong calibration if its results lie close to the line $y=x$ (the identity line). The grey lines indicate the performance of individual testing sets, while the blue lines indicates pooled performance. At $t=1$ and $t=2$, the MRS and PI models perform well. At $t=3$, $t=4$, and $t=5$, the CAP and MRS models perform well. Overall, the MRS model performs well across all horizons considered.
@@ -166,7 +178,7 @@ CV_ROC_results <- map_dfr(1:5, function(i) {
 })
 ```
 
-```{r roc-curves-results, fig.width=20, fig.height = 20}
+```{r roc-curves-results}
 ggplot(CV_ROC_results, aes(x = FPR, y = TPR)) +
   geom_line(aes(group = fold), alpha = 0.3, color = "gray") +
   geom_line(stat = "smooth", method = "loess", se = FALSE, color = "blue") +
@@ -183,37 +195,6 @@ AUC_summary <- CV_ROC_results %>%
   summarize(mean_AUC = mean(AUC), sd_AUC = sd(AUC), .groups = "drop")
 
 print(AUC_summary)
-
-## facet by time - overlay by model, AUC in legend
-
-# create df with labels for each pooled plot with AUC values in ()
-AUC_labels <- CV_ROC_results %>%
-  left_join(AUC_summary, by = c("model", "time")) %>%
-  mutate(model_label = paste0(model, " (AUC = ", round(mean_AUC, 3), ")"))
-
-# generate list of ggplots
-plot_list <- AUC_labels %>%
-  split(.$time) %>%
-  map(~{
-    ggplot(.x, aes(x = FPR, y = TPR, color = as.factor(model_label))) +
-      geom_line(aes(group = interaction(fold, model_label)), alpha = 0) +
-      geom_smooth(se = FALSE, method = "loess", size = 1.1) +
-      geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
-      coord_fixed(ratio = 1) +
-      xlim(0, 1) + ylim(0, 1) +
-      labs(
-        title = paste0("Calibration at Time ", unique(.x$time)),
-        x = "Predicted Risk",
-        y = "Observed Proportion",
-        color = "Model (AUC)"
-      ) +
-      theme_minimal()
-  })
-
-# print list of ggplots
-library(patchwork)
-wrap_plots(plot_list, ncol = 2)  # adjust as needed
-
 ```
 
 Time-dependent receiver operating characteristic (ROC) curves demonstrate a model's discriminative ability for individual time points. To summarise these curves, we calculate the area under the curve (AUC). AUC values near 1 indicate strong performance, while values close to 0 indicate poor performance. The CAP and PI models produce AUC values between 77 and 81, whereas the MRS model produces values between 85 and 87. Overall, these results indicate that the MRS model best distinguishes between patients who will be diagnosed by time $t$ and those who will not for all values of $t$ considered.
@@ -271,7 +252,7 @@ CV_UnoC_results <- map_dfr(1:5, function(i) {
   pivot_longer(cols = c(CAP, MRS, PI), names_to = "model", values_to = "UnoC")
 ```
 
-```{r IPCW-roc-curve-results}
+```{r IPCW-roc-curve-table}
 # Summary table
 UnoC_summary <- CV_UnoC_results %>%
   mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
@@ -279,7 +260,10 @@ UnoC_summary <- CV_UnoC_results %>%
   summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop")
 
 print(UnoC_summary)
+```
 
+
+```{r}
 # Compute global UnoC summaries for use in legend
 global_labels <- CV_UnoC_results %>%
   filter(is.na(time)) %>%

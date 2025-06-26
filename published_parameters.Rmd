@@ -1,0 +1,366 @@
+---
+title: "Published Parameters"
+author: "Abby Foes"
+date: "`r Sys.Date()`"
+output: html_document
+---
+## setup
+```{r setup}
+
+setwd("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project")
+
+source("Langbehn_functions.R")
+source("metric_functions.R")
+
+```
+
+## parameters
+```{r data-params}
+
+ENROLL_HD <- readRDS("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/enrollhd_baseline_survival_data.rds") %>%
+  ungroup()
+
+all_models_data_complete <- ENROLL_HD %>%
+  filter(W != 0) %>%
+  filter(complete.cases(select(., W, delta, CAG, age_0,
+                               diagconf, motscore, scnt1, swrt1,
+                               sit1, sdmt1))) %>%
+  filter(CAG > 40 & CAG < 57) %>%
+  mutate(
+    W_age = age_0 + W,
+    motscore2 = motscore^2,
+    CAP = age_0 * (CAG - 33.66),
+    DCL1 = as.numeric(diagconf == 1),
+    DCL2 = as.numeric(diagconf == 2),
+    DCL3 = as.numeric(diagconf == 3)
+  )
+
+langbehn_params <- list(
+  a     = -21.54,
+  b     =  9.56,
+  c     =  0.146,
+  d     = 35.55,
+  e     = 17.72,
+  f     = 0.327
+)
+mrs_params <- list(
+  age      = -0.282,
+  CAG      =  0.140,
+  TMS      =  0.565,
+  SDMT     = -0.021,
+  DCL1     =  0.347,
+  DCL2     =  0.542,
+  DCL3     =  1.086,
+  SC       = -0.004,
+  SW       =  0.002,
+  SI       = -0.023,
+  TMS2     = -0.004,          # TMS squared term
+  TMSxCAG  = -0.010,          # TMS × CAG interaction
+  AGExCAG  =  0.009           # Age × CAG interaction
+)
+pin_params <- list(
+  TMS_coef  =  51,
+  SDMT_coef = -34,
+  CAP_coef  =   7,
+  intercept = -883,
+  scale     = 1044
+)
+#cap_params <- list(cag_center = 33.66)
+cap_params <- list(
+  alpha = 4.4196,
+  beta = -0.0065
+)
+```
+
+## new coding - apply models with published parameter estimates
+
+```{r UNOc}
+library(dplyr)
+
+ENROLL <- all_models_data_complete %>%
+  mutate(
+    motscore2 = motscore^2,
+    DCL1 = as.numeric(diagconf == 1),
+    DCL2 = as.numeric(diagconf == 2),
+    DCL3 = as.numeric(diagconf == 3),
+
+    # CAP: negated linear predictor = log-logistic AFT risk score
+    CAP_risk = -(cap_params$alpha + cap_params$beta * CAP),
+
+    # MRS: direct application of linear formula
+    MRS = mrs_params$age       * age_0 +
+          mrs_params$CAG       * CAG +
+          mrs_params$TMS       * motscore +
+          mrs_params$SDMT      * sdmt1 +
+          mrs_params$DCL1      * DCL1 +
+          mrs_params$DCL2      * DCL2 +
+          mrs_params$DCL3      * DCL3 +
+          mrs_params$SC        * scnt1 +
+          mrs_params$SW        * swrt1 +
+          mrs_params$SI        * sit1 +
+          mrs_params$TMS2      * motscore2 +
+          mrs_params$TMSxCAG   * motscore * CAG +
+          mrs_params$AGExCAG   * age_0 * CAG,
+
+    # PI: scaled linear combination
+    PI = (pin_params$TMS_coef  * motscore +
+          pin_params$SDMT_coef * sdmt1 +
+          pin_params$CAP_coef  * CAP +
+          pin_params$intercept) / pin_params$scale,
+
+    # Langbehn: risk of diagnosis = 1 - survival probability
+    Langbehn_risk = {
+      num <- pi * (langbehn_params$a - 
+                   exp(langbehn_params$b - langbehn_params$c * CAG) + age_0)
+      denom <- sqrt(3) * sqrt(
+        langbehn_params$d + 
+        exp(langbehn_params$e - langbehn_params$f * CAG)
+      )
+      surv_prob <- 1 / (1 + exp(num / denom))
+      1 - surv_prob
+    }
+  )
+t_stars <- 1:8
+surv_obj <- Surv(ENROLL$W, ENROLL$delta)
+
+UnoC_results <- map_dfr(t_stars, function(t_star) {
+  tibble(
+    time = t_star,
+    CAP = AUC.uno(surv_obj, surv_obj, ENROLL$CAP_risk, times = t_star)$iauc,
+    MRS = AUC.uno(surv_obj, surv_obj, ENROLL$MRS, times = t_star)$iauc,
+    PI  = AUC.uno(surv_obj, surv_obj, ENROLL$PI,  times = t_star)$iauc,
+    Langbehn = AUC.uno(surv_obj, surv_obj, ENROLL$Langbehn_risk, times = t_star)$iauc
+  )
+}) 
+
+UnoC_results_long <- UnoC_results %>%
+  pivot_longer(cols = c(CAP, MRS, PI, Langbehn), names_to = "model", values_to = "UnoC")
+
+global_UnoC <- tibble(
+  model = c("CAP", "MRS", "PI", "Langbehn"),
+  global_iAUC = c(
+    AUC.uno(surv_obj, surv_obj, ENROLL$CAP_risk, times = t_stars)$iauc,
+    AUC.uno(surv_obj, surv_obj, ENROLL$MRS, times = t_stars)$iauc,
+    AUC.uno(surv_obj, surv_obj, ENROLL$PI,  times = t_stars)$iauc,
+    AUC.uno(surv_obj, surv_obj, ENROLL$Langbehn_risk, times = t_stars)$iauc
+  )
+)
+
+ggplot(UnoC_results_long, aes(x = time, y = UnoC, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Time-dependent Uno's C",
+    x = "Time (t*)",
+    y = "Uno's C (iAUC)",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 13)
+```
+## new coding CV
+```{r UnoC-CV}
+library(rsample)
+library(dplyr)
+library(tidyr)
+library(survAUC)
+library(purrr)
+library(tibble)
+
+set.seed(2024)
+folds <- vfold_cv(all_models_data_complete, v = 5)
+
+t_stars <- 1:8
+
+CV_UnoC_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data  <- assessment(split)
+
+  # Step 1: Compute variables
+  test_data <- test_data %>%
+    mutate(
+
+      MRS = mrs_params$age       * age_0 +
+            mrs_params$CAG       * CAG +
+            mrs_params$TMS       * motscore +
+            mrs_params$SDMT      * sdmt1 +
+            mrs_params$DCL1      * DCL1 +
+            mrs_params$DCL2      * DCL2 +
+            mrs_params$DCL3      * DCL3 +
+            mrs_params$SC        * scnt1 +
+            mrs_params$SW        * swrt1 +
+            mrs_params$SI        * sit1 +
+            mrs_params$TMS2      * motscore^2 +
+            mrs_params$TMSxCAG   * motscore * CAG +
+            mrs_params$AGExCAG   * age_0 * CAG,
+
+      PI = (pin_params$TMS_coef  * motscore +
+            pin_params$SDMT_coef * sdmt1 +
+            pin_params$CAP_coef  * CAP +
+            pin_params$intercept) / pin_params$scale,
+
+      Langbehn_risk = {
+        num <- pi * (langbehn_params$a - exp(langbehn_params$b - langbehn_params$c * CAG) + age_0)
+        denom <- sqrt(3) * sqrt(langbehn_params$d + exp(langbehn_params$e - langbehn_params$f * CAG))
+        1 - 1 / (1 + exp(num / denom))
+      },
+      
+      CAP_risk = {
+        CAP_lp <- cap_params$alpha + cap_params$beta * CAP
+        -CAP_lp
+      }    
+  )
+
+  surv_obj_test <- Surv(test_data$W, test_data$delta)
+  surv_obj_train <- Surv(train_data$W, train_data$delta)
+
+  # Step 2: Compute Uno's C at each t_star
+  map_dfr(t_stars, function(t_star) {
+    tibble(
+      fold = i,
+      time = t_star,
+      CAP = AUC.uno(surv_obj_test, surv_obj_train, test_data$CAP_risk, times = t_star)$iauc,
+      MRS = AUC.uno(surv_obj_test, surv_obj_train, test_data$MRS, times = t_star)$iauc,
+      PI  = AUC.uno(surv_obj_test, surv_obj_train, test_data$PI,  times = t_star)$iauc,
+      Langbehn = AUC.uno(surv_obj_test, surv_obj_train, test_data$Langbehn_risk, times = t_star)$iauc
+    )
+  })
+}) %>%
+  pivot_longer(cols = c(CAP, MRS, PI, Langbehn), names_to = "model", values_to = "UnoC")
+
+UnoC_summary <- CV_UnoC_results %>%
+  group_by(model, time) %>%
+  summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop")
+
+print(UnoC_summary)
+
+global_labels <- CV_UnoC_results %>%
+  group_by(model, fold) %>%
+  summarize(iAUC = mean(UnoC, na.rm = TRUE), .groups = "drop") %>%
+  group_by(model) %>%
+  summarize(mean_iAUC = mean(iAUC), .groups = "drop") %>%
+  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
+
+# Create a named vector for use in scale_color_discrete()
+model_labels <- deframe(global_labels[, c("model", "label")])
+
+library(ggplot2)
+
+ggplot(CV_UnoC_results, aes(x = time, y = UnoC, color = model)) +
+  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
+  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels) +
+  labs(
+    x = "Time (t*)",
+    y = "Uno's C",
+    title = "5-Fold CV IPCW-AUC (Uno’s C) with Published Parameters"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+## Redo with Kyle's CV code
+
+```{r IPCW-roc-curves}
+
+set.seed(2024)
+folds <- vfold_cv(all_models_data_complete, v = 5)
+
+CV_UnoC_results <- map_dfr(1:5, function(i) {
+  split <- folds$splits[[i]]
+  test_data  <- assessment(split)
+  surv_obj <- Surv(test_data$W, test_data$delta)
+  t_stars <- 1:8
+
+  # Manually compute linear predictors from published coefs
+  
+  ## MRS
+  MRS <- with(test_data, 
+    mrs_params$age    * age_0 +
+    mrs_params$CAG    * CAG +
+    mrs_params$TMS    * motscore +
+    mrs_params$SDMT   * sdmt1 +
+    mrs_params$DCL1   * DCL1 +
+    mrs_params$DCL2   * DCL2 +
+    mrs_params$DCL3   * DCL3 +
+    mrs_params$SC     * scnt1 +
+    mrs_params$SW     * swrt1 +
+    mrs_params$SI     * sit1 +
+    mrs_params$TMS2   * motscore2 +
+    mrs_params$TMSxCAG * motscore * CAG +
+    mrs_params$AGExCAG * age_0 * CAG
+  )
+  
+  ## PIN
+  PI <- with(test_data,
+    (pin_params$TMS_coef  * motscore +
+     pin_params$SDMT_coef * sdmt1 +
+     pin_params$CAP_coef  * CAP +
+     pin_params$intercept) / pin_params$scale
+  )
+  
+  lp_CAP <- cap_params$alpha + cap_params$beta * test_data$CAP
+  
+  time_specific <- map_dfr(t_stars, function(t_star) {
+    tibble(
+      fold = i,
+      time = t_star,
+      CAP = AUC.uno(surv_obj, surv_obj, -(lp_CAP), times = t_star)$iauc,
+      MRS = AUC.uno(surv_obj, surv_obj, MRS, times = t_star)$iauc,
+      PI  = AUC.uno(surv_obj, surv_obj, PI,  times = t_star)$iauc
+    )
+  })
+
+  global <- tibble(
+    fold = i,
+    time = NA,
+    CAP = AUC.uno(surv_obj, surv_obj, (-lp_CAP), times = t_stars)$iauc,
+    MRS = AUC.uno(surv_obj, surv_obj, MRS, times = t_stars)$iauc,
+    PI  = AUC.uno(surv_obj, surv_obj, PI,  times = t_stars)$iauc
+  )
+
+  bind_rows(time_specific, global)
+}) %>%
+  pivot_longer(cols = c(CAP, MRS, PI), names_to = "model", values_to = "UnoC")
+```
+
+```{r IPCW-roc-curve-table}
+# Summary table
+UnoC_summary <- CV_UnoC_results %>%
+  mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
+  group_by(model, type, time) %>%
+  summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop")
+
+print(UnoC_summary)
+```
+
+
+```{r}
+# Compute global UnoC summaries for use in legend
+global_labels <- CV_UnoC_results %>%
+  filter(is.na(time)) %>%
+  group_by(model) %>%
+  summarize(mean_iAUC = mean(UnoC), .groups = "drop") %>%
+  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
+
+# Create named vector for legend renaming
+model_labels <- deframe(global_labels[, c("model", "label")])
+
+# Plot only time-specific points (exclude global)
+CV_UnoC_results %>%
+  filter(!is.na(time)) %>%
+  ggplot(aes(x = time, y = UnoC, color = model)) +
+  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
+  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels) +
+  labs(
+    x = "Time (t*)",
+    y = "Uno's C",
+    title = "IPCW-AUC (Uno's C) Across 5-Fold CV",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
