@@ -7,7 +7,13 @@ output: html_document
 ## setup
 ```{r setup}
 
+library(rsample)
+library(dplyr)
+library(tidyr)
+library(survAUC)
 library(purrr)
+library(tibble)
+library(tidyverse)
 
 setwd("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project")
 
@@ -74,10 +80,9 @@ cap_params <- list(
 )
 ```
 
-## new coding - apply models with published parameter estimates
+## new coding - single dataset
 
 ```{r UNOc}
-library(dplyr)
 
 ENROLL <- all_models_data_complete %>%
   mutate(
@@ -159,21 +164,18 @@ ggplot(UnoC_results_long, aes(x = time, y = UnoC, color = model)) +
   ) +
   theme_minimal(base_size = 13)
 ```
+
 ## new coding CV
+
+### 5-fold looped attmpt - failing
 ```{r UnoC-CV}
-library(rsample)
-library(dplyr)
-library(tidyr)
-library(survAUC)
-library(purrr)
-library(tibble)
 
 set.seed(2024)
 folds <- vfold_cv(all_models_data_complete, v = 5)
 
 t_stars <- 1:8
 
-CV_UnoC_results <- map_dfr(1:5, function(i) {
+CV_UnoC_results <- map_dfr(1:3, function(i) {
   split <- folds$splits[[i]]
   train_data <- analysis(split)
   test_data  <- assessment(split)
@@ -262,6 +264,122 @@ ggplot(CV_UnoC_results, aes(x = time, y = UnoC, color = model)) +
 
 ```
 
+### k-fold separated loops
+```{r}
+set.seed(2024)
+folds <- vfold_cv(all_models_data_complete, v = 5)
+
+k = 3 # 3 works with small_data
+small_data <- all_models_data_complete[1:1000, ]
+folds <- vfold_cv(small_data, v = k)
+
+t_stars <- 1:8
+CV_UnoC_results <- list()  # initialize empty list to store fold results
+
+for (i in 1:k) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data  <- assessment(split)
+
+  # Step 1: Compute risk scores on test_data
+  test_data <- test_data %>% mutate(
+    MRS = mrs_params$age       * age_0 +
+          mrs_params$CAG       * CAG +
+          mrs_params$TMS       * motscore +
+          mrs_params$SDMT      * sdmt1 +
+          mrs_params$DCL1      * DCL1 +
+          mrs_params$DCL2      * DCL2 +
+          mrs_params$DCL3      * DCL3 +
+          mrs_params$SC        * scnt1 +
+          mrs_params$SW        * swrt1 +
+          mrs_params$SI        * sit1 +
+          mrs_params$TMS2      * motscore^2 +
+          mrs_params$TMSxCAG   * motscore * CAG +
+          mrs_params$AGExCAG   * age_0 * CAG,
+
+    PI = (pin_params$TMS_coef  * motscore +
+          pin_params$SDMT_coef * sdmt1 +
+          pin_params$CAP_coef  * CAP +
+          pin_params$intercept) / pin_params$scale,
+
+    Langbehn_risk = {
+      num <- pi * (langbehn_params$a - exp(langbehn_params$b - langbehn_params$c * CAG) + age_0)
+      denom <- sqrt(3) * sqrt(langbehn_params$d + exp(langbehn_params$e - langbehn_params$f * CAG))
+      1 - 1 / (1 + exp(num / denom))
+    },
+
+    CAP_risk = {
+      CAP_lp <- cap_params$alpha + cap_params$beta * CAP
+      -CAP_lp
+    }
+  )
+
+  surv_obj_test <- Surv(test_data$W, test_data$delta)
+  surv_obj_train <- Surv(train_data$W, train_data$delta)
+
+  # Step 2: Compute Uno's C for each t_star
+  fold_results <- map_dfr(t_stars, function(t_star) {
+    tibble(
+      fold = i,
+      time = t_star,
+      CAP = AUC.uno(surv_obj_test, surv_obj_train, test_data$CAP_risk, times = t_star)$iauc,
+      MRS = AUC.uno(surv_obj_test, surv_obj_train, test_data$MRS, times = t_star)$iauc,
+      PI  = AUC.uno(surv_obj_test, surv_obj_train, test_data$PI, times = t_star)$iauc,
+      Langbehn = AUC.uno(surv_obj_test, surv_obj_train, test_data$Langbehn_risk, times = t_star)$iauc
+    )
+  })
+
+  CV_UnoC_results[[i]] <- fold_results  # store each fold's results in list
+
+  # Free memory before next fold
+  rm(train_data, test_data, surv_obj_test, surv_obj_train, fold_results)
+  gc()
+}
+
+# Combine results from all folds into single data frame
+CV_UnoC_results <- bind_rows(CV_UnoC_results)
+
+# Pivot longer if needed
+CV_UnoC_results <- CV_UnoC_results %>%
+  pivot_longer(cols = c(CAP, MRS, PI, Langbehn), names_to = "model", values_to = "UnoC")
+
+# summary stats for combined results
+UnoC_summary <- CV_UnoC_results %>%
+  group_by(model, time) %>%
+  summarize(
+    mean_UnoC = mean(UnoC, na.rm = TRUE),
+    sd_UnoC = sd(UnoC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(UnoC_summary)
+
+# legend labels
+global_labels <- CV_UnoC_results %>%
+  group_by(model, fold) %>%
+  summarize(iAUC = mean(UnoC, na.rm = TRUE), .groups = "drop") %>%
+  group_by(model) %>%
+  summarize(mean_iAUC = mean(iAUC), .groups = "drop") %>%
+  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
+
+# Create named vector for use in ggplot
+model_labels <- deframe(global_labels[, c("model", "label")])
+
+ggplot(CV_UnoC_results, aes(x = time, y = UnoC, color = model)) +
+  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
+  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels) +
+  labs(
+    x = "Time (t*)",
+    y = "Uno's C",
+    title = "Cross-Validation IPCW-AUC (Uno’s C) with Published Parameters"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
 ## Redo with Kyle's CV code
 
 ```{r IPCW-roc-curves}
@@ -336,7 +454,6 @@ UnoC_summary <- CV_UnoC_results %>%
 
 print(UnoC_summary)
 ```
-
 
 ```{r}
 # Compute global UnoC summaries for use in legend
