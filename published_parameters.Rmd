@@ -7,6 +7,8 @@ output: html_document
 ## setup
 ```{r setup}
 
+library(purrr)
+
 setwd("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project")
 
 source("Langbehn_functions.R")
