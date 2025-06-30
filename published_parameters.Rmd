@@ -267,9 +267,10 @@ ggplot(CV_UnoC_results, aes(x = time, y = UnoC, color = model)) +
 ### k-fold separated loops
 ```{r}
 set.seed(2024)
-folds <- vfold_cv(all_models_data_complete, v = 5)
+k = 3 # 3 works with small_data but NOT with the full dataset
 
-k = 3 # 3 works with small_data
+folds <- vfold_cv(all_models_data_complete, v = k)
+
 small_data <- all_models_data_complete[1:1000, ]
 folds <- vfold_cv(small_data, v = k)
 
