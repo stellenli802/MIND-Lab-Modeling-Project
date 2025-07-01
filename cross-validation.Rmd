@@ -11,6 +11,7 @@ library(survival)
 library(pec)
 library(rsample)
 library(survAUC)
+library(xtable)
 
 source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/metric_functions.R")
 source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/Langbehn_functions.R")
@@ -47,63 +48,114 @@ Lastly, we restricted our data to only include patients with CAG repeat lengths 
 
 ---
 
-## 2. 5-Fold Cross-Validation for Harrell's C Index
+## 2. Split data with stratification
 
-```{r harrell-c-index}
+```{r create-CV-folds}
+# set random seed
 set.seed(2024)
-folds <- vfold_cv(all_models_data_complete, v = 5)
 
-# Preallocate output
+# create training-testing folds, with stratification by delta to preserve censoring rate
+folds <- vfold_cv(all_models_data_complete, v = 5, strata = delta)
+
+# summarize censoring information for each training and testing split
+fold_censoring_summary <- map_dfr(1:5, function(i) {
+  test_data <- assessment(folds$splits[[i]])
+  event_rate <- mean(test_data$delta == 1)
+  tibble(
+    fold = i,
+    event_rate = event_rate,
+    censoring_rate = 1 - event_rate,
+    n = nrow(test_data),
+    n_events = sum(test_data$delta == 1)
+  )
+})
+print(fold_censoring_summary)
+```
+
+```{r store-models}
+# Preallocate output for models
 fitted_models_by_fold <- vector("list", length = 5)
-c_index_list <- list()
 
 for (i in 1:5) {
+  # training-testing split i
   split <- folds$splits[[i]]
+  
+  # training set i
   train_data <- analysis(split)
+  
+  # testing set i
   test_data  <- assessment(split)
 
+  # CAP model
   CAP_model <- survreg(Surv(W, delta) ~ age_0 + CAG:age_0,
                        data = train_data, dist = "loglogistic")
-  CAP_Harrell_C <- getHarrellC(fit = CAP_model, data = test_data)
 
+  # MRS model
   MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
                        scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
                        CAG:motscore + CAG:age_0,
                      data = train_data, x = TRUE)
-  MRS_Harrell_C <- getHarrellC(fit = MRS_model, data = test_data)
 
+  # PI model
   PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
                     data = train_data, x = TRUE)
-  PI_Harrell_C <- getHarrellC(fit = PI_model, data = test_data)
 
-  Langbehn_params <- fit_langbehn_model(train_data, verbose = FALSE)
+  # Langbehn_params <- fit_langbehn_model(train_data, verbose = FALSE)
 
-  # Optional: Compute C for Langbehn if convergence succeeded
-  # Langbehn_Harrell_C <- getHarrellC(fit = Langbehn_params, data = test_data, model_type = "langbehn")
-
-  # Store models
+  # Linear predictors (negate for AFT to maintain directionality)
+  lp_CAP <- -predict(CAP_model, newdata = test_data, type = "lp")
+  lp_MRS <-  predict(MRS_model, newdata = test_data, type = "lp")
+  lp_PI  <-  predict(PI_model,  newdata = test_data, type = "lp")
+  
+  # Store models, linear predictors, and training and testing data
   fitted_models_by_fold[[i]] <- list(
     CAP = CAP_model,
     MRS = MRS_model,
     PI = PI_model,
-    Langbehn = Langbehn_params
+    # Langbehn = Langbehn_params,
+    lp_CAP = lp_CAP,
+    lp_MRS = lp_MRS,
+    lp_PI  = lp_PI,
+    train_data = train_data,
+    test_data = test_data
   )
+}
+```
 
+---
+
+## 3. Harrell's C index
+
+```{r}
+# Preallocate output
+c_index_list <- list()
+
+for (i in 1:5) {
+  # grab stored models and testing data
+  models <- fitted_models_by_fold[[i]]
+  test_data  <- models$test_data
+
+  # save Harrell's C index estimates for fold i
   c_index_list[[i]] <- tibble(
     fold = i,
-    model = c("CAP", "MRS", "PI"),  # Add "Langbehn" if included above
-    c_index = c(CAP_Harrell_C, MRS_Harrell_C, PI_Harrell_C)  # , Langbehn_Harrell_C
+    model = c("CAP", "MRS", "PI"),
+    c_index = c(
+      getHarrellC(fit = models$CAP, data = test_data),
+      getHarrellC(fit = models$MRS, data = test_data),
+      getHarrellC(fit = models$PI,  data = test_data)
+      # Optional: Compute C for Langbehn if convergence succeeded
+      # Langbehn_Harrell_C <- getHarrellC(fit = Langbehn_params, data = test_data, model_type = "langbehn")
+    )
   )
 }
 
 # Combine results
 C_index_results <- bind_rows(c_index_list)
 
-
+# Summarize Harrell's C index estimates across splits
 C_index_summary <- C_index_results %>%
   group_by(model) %>%
   summarize(mean_c = mean(c_index), sd_c = sd(c_index), .groups = "drop")
-
 print(C_index_summary)
 ```
 
@@ -111,7 +163,131 @@ Harrell's C index measures agreement between the ranking of patients by observed
 
 ---
 
-## 3. Calibration Plots from 5-Fold CV
+## 4. Time-dependent, IPCW-based ROC curves
+
+```{r IPCW-roc-curves}
+CV_UnoC_results <- map_dfr(1:5, function(i) {
+  # grab stored models and testing data
+  models <- fitted_models_by_fold[[i]]
+  train_data <- models$train_data
+  test_data  <- models$test_data
+  
+  # time horizons at which Uno's C is calculated
+  t_stars <- 1:3
+  
+  train_surv <- Surv(train_data$W, train_data$delta)
+  test_surv  <- Surv(test_data$W, test_data$delta)
+
+  # Time-specific Uno's C
+  time_specific <- map_dfr(t_stars, function(t_star) {
+    tibble(
+      fold = i,
+      time = t_star,
+      CAP = AUC.uno(train_surv, test_surv, models$lp_CAP, times = t_star)$iauc,
+      MRS = AUC.uno(train_surv, test_surv, models$lp_MRS, times = t_star)$iauc,
+      PI  = AUC.uno(train_surv, test_surv, models$lp_PI,  times = t_star)$iauc
+    )
+  })
+
+  # Global Uno's C (same fold, integrated across all t_stars)
+  global <- tibble(
+    fold = i,
+    time = NA,  # use NA to indicate this is global
+    CAP = AUC.uno(train_surv, test_surv, models$lp_CAP, times = t_stars)$iauc,
+    MRS = AUC.uno(train_surv, test_surv, models$lp_MRS, times = t_stars)$iauc,
+    PI  = AUC.uno(train_surv, test_surv, models$lp_PI,  times = t_stars)$iauc
+  )
+
+  bind_rows(time_specific, global)
+}) %>%
+  pivot_longer(cols = c(CAP, MRS, PI), names_to = "model", values_to = "UnoC")
+```
+
+```{r Uno_C_table}
+# Create summary table
+UnoC_summary <- CV_UnoC_results %>%
+  mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
+  group_by(model, type, time) %>%
+  summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop") %>%
+  arrange(type, time, model)
+
+print(UnoC_summary)
+```
+
+```{r Uno_C_table_LaTeX}
+# Format LaTeX table with rounded values
+UnoC_summary_latex <- UnoC_summary %>%
+  mutate(
+    mean_UnoC = sprintf("%.3f", mean_UnoC),
+    sd_UnoC   = sprintf("%.3f", sd_UnoC),
+    UnoC_with_sd = paste0(mean_UnoC, " (", sd_UnoC, ")")
+  ) %>%
+  select(type, time, model, UnoC_with_sd) %>%
+  pivot_wider(names_from = model, values_from = UnoC_with_sd)
+
+# Generate xtable object
+xtable_UnoC <- xtable(UnoC_summary_latex, 
+                      caption = "Uno's C statistic (mean and SD across 5-fold CV) by model and evaluation time.",
+                      label = "tab:UnoC_summary",
+                      align = c("l", "l", "c", "c", "c", "c"))
+
+print(xtable_UnoC, include.rownames = FALSE, sanitize.text.function = identity)
+```
+
+
+```{r Uno_C_plot}
+# Compute global UnoC summaries for use in legend
+global_labels <- CV_UnoC_results %>%
+  filter(is.na(time)) %>%
+  group_by(model) %>%
+  summarize(mean_iAUC = mean(UnoC), .groups = "drop") %>%
+  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
+
+# Create named vector for legend renaming
+model_labels <- deframe(global_labels[, c("model", "label")])
+
+# Plot only time-specific points (exclude global)
+CV_UnoC_results %>%
+  filter(!is.na(time)) %>%
+  ggplot(aes(x = time, y = UnoC, color = model)) +
+  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
+  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels) +
+  labs(
+    x = "Time (t*)",
+    y = "Uno's C",
+    title = "IPCW-AUC (Uno's C) Across 5-Fold CV",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+```{r}
+map_dfr(1:5, function(i) {
+  test_data <- fitted_models_by_fold[[i]]$test_data
+  map_dfr(1:8, function(t_star) {
+    tibble(
+      fold = i,
+      t_star = t_star,
+      n_events_by_t = sum(test_data$W <= t_star & test_data$delta == 1),
+      n_at_risk = sum(test_data$W >= t_star)
+    )
+  })
+})
+
+train_data <- analysis(folds$splits[[1]])
+fit_KM_C <- survfit(Surv(W, 1 - delta) ~ 1, data = train_data)
+
+ggsurvplot(fit_KM_C, conf.int = FALSE) +
+  ggtitle("Kaplan-Meier Curve for Censoring Distribution in Fold 1") +
+  xlab("Time") + ylab("S_C(t)")
+
+```
+
+## 5. Calibration Plots from 5-Fold CV
 
 ```{r calibration-data, include = F, cache = T}
 CV_calibration_results <- map_dfr(1:5, function(i) {
@@ -198,98 +374,6 @@ print(AUC_summary)
 ```
 
 Time-dependent receiver operating characteristic (ROC) curves demonstrate a model's discriminative ability for individual time points. To summarise these curves, we calculate the area under the curve (AUC). AUC values near 1 indicate strong performance, while values close to 0 indicate poor performance. The CAP and PI models produce AUC values between 77 and 81, whereas the MRS model produces values between 85 and 87. Overall, these results indicate that the MRS model best distinguishes between patients who will be diagnosed by time $t$ and those who will not for all values of $t$ considered.
-
----
-
-## 5. Time-dependent, IPCW-based ROC curves
-
-```{r IPCW-roc-curves}
-CV_UnoC_results <- map_dfr(1:5, function(i) {
-  split <- folds$splits[[i]]
-  train_data <- analysis(split)
-  test_data  <- assessment(split)
-
-  # Fit models on training data
-  CAP_model <- survreg(Surv(W, delta) ~ age_0 + CAG:age_0,
-                       data = train_data, dist = "loglogistic")
-  MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
-                       scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
-                       CAG:motscore + CAG:age_0,
-                     data = train_data, x = TRUE)
-  PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
-                    data = train_data, x = TRUE)
-
-  t_stars <- 1:8
-  surv_obj <- Surv(test_data$W, test_data$delta)
-
-  # Linear predictors (negate for AFT)
-  lp_CAP <- -predict(CAP_model, newdata = test_data, type = "lp")
-  lp_MRS <- predict(MRS_model, newdata = test_data, type = "lp")
-  lp_PI  <- predict(PI_model,  newdata = test_data, type = "lp")
-
-  # Time-specific Uno's C
-  time_specific <- map_dfr(t_stars, function(t_star) {
-    tibble(
-      fold = i,
-      time = t_star,
-      CAP = AUC.uno(surv_obj, surv_obj, lp_CAP, times = t_star)$iauc,
-      MRS = AUC.uno(surv_obj, surv_obj, lp_MRS, times = t_star)$iauc,
-      PI  = AUC.uno(surv_obj, surv_obj, lp_PI,  times = t_star)$iauc
-    )
-  })
-
-  # Global Uno's C (same fold, all t_stars)
-  global <- tibble(
-    fold = i,
-    time = NA,  # use NA to indicate this is global
-    CAP = AUC.uno(surv_obj, surv_obj, lp_CAP, times = t_stars)$iauc,
-    MRS = AUC.uno(surv_obj, surv_obj, lp_MRS, times = t_stars)$iauc,
-    PI  = AUC.uno(surv_obj, surv_obj, lp_PI,  times = t_stars)$iauc
-  )
-
-  bind_rows(time_specific, global)
-}) %>%
-  pivot_longer(cols = c(CAP, MRS, PI), names_to = "model", values_to = "UnoC")
-```
-
-```{r IPCW-roc-curve-table}
-# Summary table
-UnoC_summary <- CV_UnoC_results %>%
-  mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
-  group_by(model, type, time) %>%
-  summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop")
-
-print(UnoC_summary)
-```
-
-
-```{r}
-# Compute global UnoC summaries for use in legend
-global_labels <- CV_UnoC_results %>%
-  filter(is.na(time)) %>%
-  group_by(model) %>%
-  summarize(mean_iAUC = mean(UnoC), .groups = "drop") %>%
-  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
-
-# Create named vector for legend renaming
-model_labels <- deframe(global_labels[, c("model", "label")])
-
-# Plot only time-specific points (exclude global)
-CV_UnoC_results %>%
-  filter(!is.na(time)) %>%
-  ggplot(aes(x = time, y = UnoC, color = model)) +
-  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
-  geom_point(alpha = 0.6, size = 1.5) +
-  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
-  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels) +
-  labs(
-    x = "Time (t*)",
-    y = "Uno's C",
-    title = "IPCW-AUC (Uno's C) Across 5-Fold CV",
-    color = "Model"
-  ) +
-  theme_minimal(base_size = 13)
-```
 
 ---
 
