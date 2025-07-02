@@ -272,56 +272,8 @@ CV_UnoC_results %>%
 ---
 
 ```{r}
-# Calculate Uno's C statistic from scratch
-# Input: test_data with W, delta, lp (linear predictor); G_hat: KM censoring survival function
-#        t_star: time threshold
-
-# Test data and linear predictor
-test_data = fitted_models_by_fold[[1]]$test_data
-test_data$lp = fitted_models_by_fold[[1]]$lp_CAP
-
-# Training data and KM estimator
-train_data <- fitted_models_by_fold[[1]]$train_data
-km_cens <- survfit(Surv(W, 1 - delta) ~ 1, data = train_data)
-
-# Time horizon
-t_star = 1
-
-# Step function interpolation of KM curve (left-continuous step)
-G_hat <- stepfun(km_cens$time, c(1, km_cens$surv), right = FALSE)
-
-n <- nrow(test_data)
-
-# Initialize numerator and denominator of Uno's C
-concordant_sum <- 0
-weight_sum <- 0
-
-for (i in 1:n) {
-  for (j in 1:n) {
-    Ti <- test_data$W[i]
-    Tj <- test_data$W[j]
-    di <- test_data$delta[i]
-    lpi <- test_data$lp[i]
-    lpj <- test_data$lp[j]
-
-    if (Ti < Tj && Ti <= t_star && di == 1) {
-      G_Ti <- G_hat(Ti)  # Use a KM prediction function
-      wi <- ifelse(di == 1, 1 / G_Ti, 0)
-
-      concordant <- as.numeric(lpi > lpj)
-      concordant_sum <- concordant_sum + wi * concordant
-      weight_sum <- weight_sum + wi
-    }
-  }
-}
-
-uno_c_hat <- concordant_sum / weight_sum
-print(uno_c_hat)
-```
-
-```{r}
 compute_uno_c <- function(test_data, G_hat, t_star) {
-  # Extract
+  # Extract min times, event indicators, linear predictors, and sample size
   W  <- test_data$W
   d  <- test_data$delta
   lp <- test_data$lp
@@ -360,7 +312,17 @@ custom_uno_results <- map_dfr(1:5, function(fold_idx) {
 
   # Fit KM for censoring distribution from training data
   km_cens <- survfit(Surv(W, 1 - delta) ~ 1, data = train_data)
-  G_hat <- stepfun(km_cens$time, c(1, km_cens$surv), right = FALSE)
+  G_hat_left <- function(t) {
+    s <- summary(km_cens, times = unique(c(0, km_cens$time)), extend = TRUE)
+    approx(
+      x = s$time,
+      y = s$surv,
+      xout = t - 1e-8,
+      method = "constant",
+      f = 0,
+      rule = 2
+    )$y
+  }
 
   # Prepare output across models and t_star
   bind_rows(
@@ -372,17 +334,120 @@ custom_uno_results <- map_dfr(1:5, function(fold_idx) {
     group_by(model, fold) %>%
     group_modify(~ {
       test_data$lp <- .x$lp
-      map_dfr(1:5, function(t_star) {
+      map_dfr(1:8, function(t_star) {
         tibble(
           time = t_star,
-          uno_c_custom = compute_uno_c(test_data, G_hat, t_star)
+          uno_c_custom = compute_uno_c(test_data, G_hat_left, t_star)
         )
       })
     })
 })
 
 print(custom_uno_results)
+```
 
+```{r}
+# Time grid
+t_grid <- 1:8
+
+# Step 1: Gather per-fold, per-time event weights from training data
+event_weights <- map_dfr(1:5, function(fold_idx) {
+  train_data <- fitted_models_by_fold[[fold_idx]]$train_data
+
+  # Event counts at each t* in training data
+  weights <- map_dbl(t_grid, function(t) {
+    sum(train_data$W == t & train_data$delta == 1)
+  })
+  weights <- weights / sum(weights)
+
+  tibble(
+    fold = fold_idx,
+    time = t_grid,
+    weight = weights
+  )
+})
+
+# Step 2: Join weights with Uno’s C values and compute weighted mean per model/fold
+global_iAUC <- custom_uno_results %>%
+  filter(!is.na(time)) %>%
+  left_join(event_weights, by = c("fold", "time")) %>%
+  group_by(fold, model) %>%
+  summarize(
+    time = NA_integer_,
+    uno_c_custom = weighted.mean(uno_c_custom, weight, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 3: Append to original custom_uno_results
+custom_uno_results <- bind_rows(custom_uno_results, global_iAUC)
+```
+
+```{r}
+# Chunk: UnoC_custom_table
+UnoC_custom_summary <- custom_uno_results %>%
+  group_by(model, time) %>%
+  summarize(
+    mean_UnoC = mean(uno_c_custom),
+    sd_UnoC   = sd(uno_c_custom),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Custom") %>%
+  select(type, time, model, mean_UnoC, sd_UnoC)
+
+# Optional: sort NA time values to appear at top or bottom
+UnoC_custom_summary <- UnoC_custom_summary %>%
+  arrange(model, is.na(time), time)
+
+# Format LaTeX output
+UnoC_custom_summary_latex <- UnoC_custom_summary %>%
+  mutate(
+    time_label = ifelse(is.na(time), "Global", as.character(time)),
+    mean_UnoC = sprintf("%.3f", mean_UnoC),
+    sd_UnoC   = sprintf("%.3f", sd_UnoC),
+    UnoC_with_sd = paste0(mean_UnoC, " (", sd_UnoC, ")")
+  ) %>%
+  select(time = time_label, model, UnoC_with_sd) %>%
+  pivot_wider(names_from = model, values_from = UnoC_with_sd)
+
+# Generate LaTeX table
+xtable_UnoC_custom <- xtable(UnoC_custom_summary_latex,
+                             caption = "Custom Uno's C statistic (mean and SD across 5-fold CV) by model and evaluation time (including global).",
+                             label = "tab:UnoC_custom_summary",
+                             align = c("l", "c", "c", "c", "c"))
+
+print(xtable_UnoC_custom, include.rownames = FALSE, sanitize.text.function = identity)
+```
+
+```{r custom-uno-c-plot}
+# Compute global UnoC summaries for use in legend
+global_labels_custom <- custom_uno_results %>%
+  filter(is.na(time)) %>%
+  group_by(model) %>%
+  summarize(mean_iAUC = mean(uno_c_custom), .groups = "drop") %>%
+  mutate(label = paste0(model, " (iAUC = ", round(mean_iAUC, 3), ")"))
+
+# Create named vector for legend labels
+model_labels_custom <- deframe(global_labels_custom[, c("model", "label")])
+
+# Plot only time-specific values (exclude global NA)
+custom_uno_results %>%
+  filter(!is.na(time)) %>%
+  ggplot(aes(x = time, y = uno_c_custom, color = model)) +
+  geom_line(aes(group = interaction(model, fold)), alpha = 0.3) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_summary(fun = mean, geom = "line", aes(group = model), linewidth = 1.2) +
+  scale_color_viridis_d(name = "Model (Global iAUC)", labels = model_labels_custom) +
+  labs(
+    x = "Time (t*)",
+    y = "Uno's C",
+    title = "IPCW-AUC (Uno's C) Across 5-Fold CV (Custom Calculation)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+```{r}
+# compare custom Uno function to AUC.uno()
 comparison_table <- custom_uno_results %>%
   mutate(model = case_when(model == "PIN" ~ "PI",
                            model != "PIN" ~ model)) %>%
