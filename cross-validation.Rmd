@@ -189,13 +189,19 @@ CV_UnoC_results <- map_dfr(1:5, function(i) {
     )
   })
 
-  # Global Uno's C (same fold, integrated across all t_stars)
+   # Estimate weights = Pr(event at t_star) using test data
+  weights <- map_dbl(t_stars, function(t) {
+    sum(train_data$W == t & train_data$delta == 1)
+  })
+  weights <- weights / sum(weights)  # normalize to sum to 1
+
+  # Compute weighted average Uno's C
   global <- tibble(
     fold = i,
-    time = NA,  # use NA to indicate this is global
-    CAP = AUC.uno(train_surv, test_surv, models$lp_CAP, times = t_stars)$iauc,
-    MRS = AUC.uno(train_surv, test_surv, models$lp_MRS, times = t_stars)$iauc,
-    PI  = AUC.uno(train_surv, test_surv, models$lp_PI,  times = t_stars)$iauc
+    time = NA,
+    CAP = weighted.mean(time_specific$CAP, weights, na.rm = TRUE),
+    MRS = weighted.mean(time_specific$MRS, weights, na.rm = TRUE),
+    PI  = weighted.mean(time_specific$PI,  weights, na.rm = TRUE)
   )
 
   bind_rows(time_specific, global)
@@ -266,25 +272,130 @@ CV_UnoC_results %>%
 ---
 
 ```{r}
-map_dfr(1:5, function(i) {
-  test_data <- fitted_models_by_fold[[i]]$test_data
-  map_dfr(1:8, function(t_star) {
-    tibble(
-      fold = i,
-      t_star = t_star,
-      n_events_by_t = sum(test_data$W <= t_star & test_data$delta == 1),
-      n_at_risk = sum(test_data$W >= t_star)
-    )
-  })
+# Calculate Uno's C statistic from scratch
+# Input: test_data with W, delta, lp (linear predictor); G_hat: KM censoring survival function
+#        t_star: time threshold
+
+# Test data and linear predictor
+test_data = fitted_models_by_fold[[1]]$test_data
+test_data$lp = fitted_models_by_fold[[1]]$lp_CAP
+
+# Training data and KM estimator
+train_data <- fitted_models_by_fold[[1]]$train_data
+km_cens <- survfit(Surv(W, 1 - delta) ~ 1, data = train_data)
+
+# Time horizon
+t_star = 1
+
+# Step function interpolation of KM curve (left-continuous step)
+G_hat <- stepfun(km_cens$time, c(1, km_cens$surv), right = FALSE)
+
+n <- nrow(test_data)
+
+# Initialize numerator and denominator of Uno's C
+concordant_sum <- 0
+weight_sum <- 0
+
+for (i in 1:n) {
+  for (j in 1:n) {
+    Ti <- test_data$W[i]
+    Tj <- test_data$W[j]
+    di <- test_data$delta[i]
+    lpi <- test_data$lp[i]
+    lpj <- test_data$lp[j]
+
+    if (Ti < Tj && Ti <= t_star && di == 1) {
+      G_Ti <- G_hat(Ti)  # Use a KM prediction function
+      wi <- ifelse(di == 1, 1 / G_Ti, 0)
+
+      concordant <- as.numeric(lpi > lpj)
+      concordant_sum <- concordant_sum + wi * concordant
+      weight_sum <- weight_sum + wi
+    }
+  }
+}
+
+uno_c_hat <- concordant_sum / weight_sum
+print(uno_c_hat)
+```
+
+```{r}
+compute_uno_c <- function(test_data, G_hat, t_star) {
+  # Extract
+  W  <- test_data$W
+  d  <- test_data$delta
+  lp <- test_data$lp
+  n  <- length(W)
+
+  # Create all pairwise combinations
+  pair_df <- expand.grid(i = 1:n, j = 1:n) %>%
+    filter(i != j)
+
+  # Extract values for each pair
+  Ti <- W[pair_df$i]
+  Tj <- W[pair_df$j]
+  di <- d[pair_df$i]
+  lpi <- lp[pair_df$i]
+  lpj <- lp[pair_df$j]
+
+  # Identify valid comparable pairs
+  valid_pairs <- which(Ti < Tj & Ti <= t_star & di == 1)
+  if (length(valid_pairs) == 0) return(NA_real_)
+
+  # Weights
+  G_Ti <- G_hat(Ti[valid_pairs])
+  wi <- 1 / (G_Ti^2)
+
+  # Concordance
+  concordant <- as.numeric(lpi[valid_pairs] > lpj[valid_pairs])
+
+  # Compute Uno's C
+  sum(wi * concordant) / sum(wi)
+}
+
+custom_uno_results <- map_dfr(1:5, function(fold_idx) {
+  models <- fitted_models_by_fold[[fold_idx]]
+  train_data <- models$train_data
+  test_data  <- models$test_data
+
+  # Fit KM for censoring distribution from training data
+  km_cens <- survfit(Surv(W, 1 - delta) ~ 1, data = train_data)
+  G_hat <- stepfun(km_cens$time, c(1, km_cens$surv), right = FALSE)
+
+  # Prepare output across models and t_star
+  bind_rows(
+    tibble(model = "CAP", lp = models$lp_CAP),
+    tibble(model = "MRS", lp = models$lp_MRS),
+    tibble(model = "PIN", lp = models$lp_PI)
+  ) %>%
+    mutate(fold = fold_idx) %>%
+    group_by(model, fold) %>%
+    group_modify(~ {
+      test_data$lp <- .x$lp
+      map_dfr(1:5, function(t_star) {
+        tibble(
+          time = t_star,
+          uno_c_custom = compute_uno_c(test_data, G_hat, t_star)
+        )
+      })
+    })
 })
 
-train_data <- analysis(folds$splits[[1]])
-fit_KM_C <- survfit(Surv(W, 1 - delta) ~ 1, data = train_data)
+print(custom_uno_results)
 
-ggsurvplot(fit_KM_C, conf.int = FALSE) +
-  ggtitle("Kaplan-Meier Curve for Censoring Distribution in Fold 1") +
-  xlab("Time") + ylab("S_C(t)")
+comparison_table <- custom_uno_results %>%
+  mutate(model = case_when(model == "PIN" ~ "PI",
+                           model != "PIN" ~ model)) %>%
+  left_join(
+    CV_UnoC_results %>% filter(!is.na(time)),
+    by = c("fold", "model", "time")
+  ) %>%
+  rename(uno_c_aucuno = UnoC)
 
+comparison_table %>%
+  mutate(diff = uno_c_custom - uno_c_aucuno) %>%
+  print(n = Inf) %>%
+  view()
 ```
 
 ## 5. Calibration Plots from 5-Fold CV
