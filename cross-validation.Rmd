@@ -272,6 +272,12 @@ CV_UnoC_results %>%
 ---
 
 ```{r}
+# test_data: data for which Uno's C is to be calculated, containing 
+#   W     = min(X, C), 
+#   delta = I(X <= C)
+#   lp    = linear predictor such that higher lp indicates higher risk
+# G_hat: estimated survival function of C, used to calculate weights
+# t_star: follow-up time of interest
 compute_uno_c <- function(test_data, G_hat, t_star) {
   # Extract min times, event indicators, linear predictors, and sample size
   W  <- test_data$W
@@ -279,7 +285,7 @@ compute_uno_c <- function(test_data, G_hat, t_star) {
   lp <- test_data$lp
   n  <- length(W)
 
-  # Create all pairwise combinations
+  # Create all pairwise combinations, dropping i == j
   pair_df <- expand.grid(i = 1:n, j = 1:n) %>%
     filter(i != j)
 
@@ -290,18 +296,18 @@ compute_uno_c <- function(test_data, G_hat, t_star) {
   lpi <- lp[pair_df$i]
   lpj <- lp[pair_df$j]
 
-  # Identify valid comparable pairs
+  # Identify valid comparable pairs (Equation (6) in Uno et al. (2011))
   valid_pairs <- which(Ti < Tj & Ti <= t_star & di == 1)
   if (length(valid_pairs) == 0) return(NA_real_)
 
-  # Weights
+  # Calculate inverse probability of censoring weights
   G_Ti <- G_hat(Ti[valid_pairs])
   wi <- 1 / (G_Ti^2)
 
-  # Concordance
+  # Concordance: a pair is concordant if the LP[i] > LP[j]
   concordant <- as.numeric(lpi[valid_pairs] > lpj[valid_pairs])
 
-  # Compute Uno's C
+  # Compute Uno's C (Equation (6) in Uno et al. (2011))
   sum(wi * concordant) / sum(wi)
 }
 
