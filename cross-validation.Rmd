@@ -14,7 +14,7 @@ library(survAUC)
 library(xtable)
 
 source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/metric_functions.R")
-source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/Langbehn_functions.R")
+source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/Langbehn_functions.R")
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
@@ -53,12 +53,13 @@ Lastly, we restricted our data to only include patients with CAG repeat lengths 
 ```{r create-CV-folds}
 # set random seed
 set.seed(2024)
+n_splits = 5
 
 # create training-testing folds, with stratification by delta to preserve censoring rate
-folds <- vfold_cv(all_models_data_complete, v = 5, strata = delta)
+folds <- vfold_cv(all_models_data_complete, v = n_splits, strata = delta)
 
 # summarize censoring information for each training and testing split
-fold_censoring_summary <- map_dfr(1:5, function(i) {
+fold_censoring_summary <- map_dfr(1:n_splits, function(i) {
   test_data <- assessment(folds$splits[[i]])
   event_rate <- mean(test_data$delta == 1)
   tibble(
@@ -74,9 +75,9 @@ print(fold_censoring_summary)
 
 ```{r store-models}
 # Preallocate output for models
-fitted_models_by_fold <- vector("list", length = 5)
+fitted_models_by_fold <- vector("list", length = n_splits)
 
-for (i in 1:5) {
+for (i in 1:n_splits) {
   # training-testing split i
   split <- folds$splits[[i]]
   
@@ -100,26 +101,52 @@ for (i in 1:5) {
   PI_model <- coxph(Surv(W, delta) ~ motscore + sdmt1 + CAP,
                     data = train_data, x = TRUE)
 
-  # Langbehn_params <- fit_langbehn_model(train_data, verbose = FALSE)
+  Langbehn_params <- tryCatch(
+  fit_langbehn_model(train_data, decay_vals = c(0.13, 0.14)),
+  error = function(e) {
+    message(paste("Langbehn fit failed on fold", i, ":", e$message))
+    return(NULL)
+    }
+  )
 
   # Linear predictors (negate for AFT to maintain directionality)
   lp_CAP <- -predict(CAP_model, newdata = test_data, type = "lp")
   lp_MRS <-  predict(MRS_model, newdata = test_data, type = "lp")
   lp_PI  <-  predict(PI_model,  newdata = test_data, type = "lp")
   
+   # Langbehn-based risk score (CDF of diagnosis in next 5 years)
+  risk_Langbehn <- Langbehn_cond_CDF(Langbehn_params,
+                                     current_age = test_data$W_age,
+                                     time_to_diag = 5,
+                                     cag = test_data$CAG)
+  
   # Store models, linear predictors, and training and testing data
   fitted_models_by_fold[[i]] <- list(
     CAP = CAP_model,
     MRS = MRS_model,
     PI = PI_model,
-    # Langbehn = Langbehn_params,
+    Langbehn = Langbehn_params,
     lp_CAP = lp_CAP,
     lp_MRS = lp_MRS,
     lp_PI  = lp_PI,
+    lp_Langbehn = risk_Langbehn,
     train_data = train_data,
     test_data = test_data
   )
 }
+
+# Extract Langbehn parameter estimates across folds
+langbehn_params_all <- map(fitted_models_by_fold, ~ .x$Langbehn) %>%
+  do.call(rbind, .) %>%
+  as.data.frame()
+
+# Optional: name the parameters for clarity
+colnames(langbehn_params_all) <- c("mu_intercept", "mu_scale", "mu_decay",
+                                   "sigma_intercept", "sigma_scale", "sigma_decay")
+
+# Show the parameter estimates across folds
+print(langbehn_params_all)
+
 ```
 
 ---
@@ -183,6 +210,7 @@ CV_UnoC_results <- map_dfr(1:5, function(i) {
     tibble(
       fold = i,
       time = t_star,
+      Langbehn = AUC.uno(train_surv, test_surv, models$lp_Langbehn, times = t_star)$iauc,
       CAP = AUC.uno(train_surv, test_surv, models$lp_CAP, times = t_star)$iauc,
       MRS = AUC.uno(train_surv, test_surv, models$lp_MRS, times = t_star)$iauc,
       PI  = AUC.uno(train_surv, test_surv, models$lp_PI,  times = t_star)$iauc
@@ -199,6 +227,7 @@ CV_UnoC_results <- map_dfr(1:5, function(i) {
   global <- tibble(
     fold = i,
     time = NA,
+    Langbehn = weighted.mean(time_specific$Langbehn, weights, na.rm = TRUE),
     CAP = weighted.mean(time_specific$CAP, weights, na.rm = TRUE),
     MRS = weighted.mean(time_specific$MRS, weights, na.rm = TRUE),
     PI  = weighted.mean(time_specific$PI,  weights, na.rm = TRUE)
@@ -206,7 +235,7 @@ CV_UnoC_results <- map_dfr(1:5, function(i) {
 
   bind_rows(time_specific, global)
 }) %>%
-  pivot_longer(cols = c(CAP, MRS, PI), names_to = "model", values_to = "UnoC")
+  pivot_longer(cols = c(Langbehn, CAP, MRS, PI), names_to = "model", values_to = "UnoC")
 ```
 
 ```{r Uno_C_table}
@@ -332,6 +361,7 @@ custom_uno_results <- map_dfr(1:5, function(fold_idx) {
 
   # Prepare output across models and t_star
   bind_rows(
+    tibble(model = "Langbehn", lp = models$lp_Langbehn),
     tibble(model = "CAP", lp = models$lp_CAP),
     tibble(model = "MRS", lp = models$lp_MRS),
     tibble(model = "PIN", lp = models$lp_PI)
@@ -419,7 +449,7 @@ UnoC_custom_summary_latex <- UnoC_custom_summary %>%
 xtable_UnoC_custom <- xtable(UnoC_custom_summary_latex,
                              caption = "Custom Uno's C statistic (mean and SD across 5-fold CV) by model and evaluation time (including global).",
                              label = "tab:UnoC_custom_summary",
-                             align = c("l", "c", "c", "c", "c"))
+                             align = c("l", "c", "c", "c", "c", "c"))
 
 print(xtable_UnoC_custom, include.rownames = FALSE, sanitize.text.function = identity)
 ```
