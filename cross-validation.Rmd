@@ -96,7 +96,8 @@ for (i in 1:n_splits) {
                        data = train_data, dist = "loglogistic")
 
   # MRS model
-  MRS_model <- coxph(Surv(W, delta) ~ diagconf + motscore + motscore2 +
+  MRS_model <- coxph(Surv(W, delta) ~ diagconf1 + diagconf2 + diagconf3 +
+                       motscore + motscore2 +
                        scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
                        CAG:motscore + CAG:age_0,
                      data = train_data, x = TRUE)
@@ -120,7 +121,7 @@ for (i in 1:n_splits) {
   
    # Langbehn-based risk score (CDF of diagnosis in next 5 years)
   risk_Langbehn <- Langbehn_cond_CDF(Langbehn_params,
-                                     current_age = test_data$W_age,
+                                     current_age = test_data$age_0,
                                      time_to_diag = 5,
                                      cag = test_data$CAG)
   
