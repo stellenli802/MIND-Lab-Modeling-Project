@@ -34,7 +34,11 @@ all_models_data_complete <- ENROLL %>%
   mutate(
     W_age = age_0 + W,
     motscore2 = motscore^2,
-    CAP = age_0 * (CAG - 34)
+    CAP = age_0 * (CAG - 34),
+    diagconf0 = ifelse(diagconf == 0, 1, 0),
+    diagconf1 = ifelse(diagconf == 1, 1, 0),
+    diagconf2 = ifelse(diagconf == 2, 1, 0),
+    diagconf3 = ifelse(diagconf == 3, 1, 0)
   )
 
 dim(all_models_data_complete)
@@ -510,7 +514,7 @@ langbehn_params <- list(
   sigma_scale     = 17.72,
   sigma_decay     =  0.327
 )
-langbehn_params <- c(21.54, 9.56, 25.55, 17.72, 0.327)
+langbehn_params <- c(21.54, 9.56, 0.146, 35.55, 17.72, 0.327)
 
 # ==== MRS Model Published Parameters ====
 mrs_params <- list(
@@ -566,7 +570,9 @@ for (i in 1:n_splits) {
   
   ## --- MRS model linear predictor from published params ---
   MRS_lp <- with(test_data,
-    mrs_params$diagconf * diagconf +
+    mrs_params$diagconf1 * diagconf1 +
+    mrs_params$diagconf2 * diagconf2 +
+    mrs_params$diagconf3 * diagconf3 +
     mrs_params$motscore * motscore +
     mrs_params$motscore2 * motscore^2 +
     mrs_params$scnt1 * scnt1 +
@@ -605,9 +611,65 @@ for (i in 1:n_splits) {
     test_data = test_data
   )
 }
-
 ```
 
+### Published parameter figures and tables
+```{r}
+pubparam_CV_UnoC_results <- map_dfr(1:5, function(i) {
+  # grab stored models and testing data
+  models <- pubparam_models_by_fold[[i]]
+  train_data <- models$train_data
+  test_data  <- models$test_data
+  
+  # time horizons at which Uno's C is calculated
+  t_stars <- 1:3
+  
+  train_surv <- Surv(train_data$W, train_data$delta)
+  test_surv  <- Surv(test_data$W, test_data$delta)
+
+  # Time-specific Uno's C
+  time_specific <- map_dfr(t_stars, function(t_star) {
+    tibble(
+      fold = i,
+      time = t_star,
+      Langbehn = AUC.uno(train_surv, test_surv, models$lp_Langbehn, times = t_star)$iauc,
+      CAP = AUC.uno(train_surv, test_surv, models$lp_CAP, times = t_star)$iauc,
+      MRS = AUC.uno(train_surv, test_surv, models$lp_MRS, times = t_star)$iauc,
+      PI  = AUC.uno(train_surv, test_surv, models$lp_PI,  times = t_star)$iauc
+    )
+  })
+
+   # Estimate weights = Pr(event at t_star) using test data
+  weights <- map_dbl(t_stars, function(t) {
+    sum(train_data$W == t & train_data$delta == 1)
+  })
+  weights <- weights / sum(weights)  # normalize to sum to 1
+
+  # Compute weighted average Uno's C
+  global <- tibble(
+    fold = i,
+    time = NA,
+    Langbehn = weighted.mean(time_specific$Langbehn, weights, na.rm = TRUE),
+    CAP = weighted.mean(time_specific$CAP, weights, na.rm = TRUE),
+    MRS = weighted.mean(time_specific$MRS, weights, na.rm = TRUE),
+    PI  = weighted.mean(time_specific$PI,  weights, na.rm = TRUE)
+  )
+
+  bind_rows(time_specific, global)
+}) %>%
+  pivot_longer(cols = c(Langbehn, CAP, MRS, PI), names_to = "model", values_to = "UnoC")
+
+
+# Create summary table
+pubparam_UnoC_summary <- pubparam_CV_UnoC_results %>%
+  mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
+  group_by(model, type, time) %>%
+  summarize(mean_UnoC = mean(UnoC), sd_UnoC = sd(UnoC), .groups = "drop") %>%
+  arrange(type, time, model)
+
+print(pubparam_UnoC_summary)
+
+```
 
 
 ## 5. Calibration Plots from 5-Fold CV
