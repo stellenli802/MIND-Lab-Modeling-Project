@@ -14,7 +14,7 @@ library(survAUC)
 library(xtable)
 
 source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/metric_functions.R")
-source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/Langbehn_functions.R")
+source("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/abby_git/MIND-Lab-Modeling-Project/Langbehn_functions.R")
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
@@ -190,7 +190,7 @@ Harrell's C index measures agreement between the ranking of patients by observed
 
 ---
 
-## 4. Time-dependent, IPCW-based ROC curves
+## 4. Time-dependent, IPCW-based UNO's C / ROC curves
 
 ```{r IPCW-roc-curves}
 CV_UnoC_results <- map_dfr(1:5, function(i) {
@@ -498,6 +498,117 @@ comparison_table %>%
   print(n = Inf) %>%
   view()
 ```
+
+### Published parameter IPCW-based UNO's C
+```{r}
+# ==== Langbehn Model Published Parameters ====
+langbehn_params <- list(
+  mu_intercept    =  21.54,
+  mu_scale        =  9.56,
+  mu_decay        =  0.146,
+  sigma_intercept = 35.55,
+  sigma_scale     = 17.72,
+  sigma_decay     =  0.327
+)
+langbehn_params <- c(21.54, 9.56, 25.55, 17.72, 0.327)
+
+# ==== MRS Model Published Parameters ====
+mrs_params <- list(
+  age_0       = -0.282,  # baseline age
+  CAG         =  0.140,  # CAG repeat length
+  motscore    =  0.565,  # Total Motor Score
+  sdmt1       = -0.021,  # Symbol Digit Modalities Test
+  diagconf1   =  0.347,  # Diagnostic Confidence Level 1
+  diagconf2   =  0.542,  # Diagnostic Confidence Level 2
+  diagconf3   =  1.086,  # Diagnostic Confidence Level 3
+  scnt1       = -0.004,  # Stroop Color Naming
+  swrt1       =  0.002,  # Stroop Word Reading
+  sit1        = -0.023,  # Stroop Interference
+  motscore2   = -0.004,  # TMS squared term
+  motscore_CAG = -0.010, # TMS × CAG interaction
+  age_CAG     =  0.009   # Age × CAG interaction
+)
+
+# ==== PIN Model Published Parameters ====
+pin_params <- list(
+  motscore_coef =  51,    # Total Motor Score coefficient
+  sdmt1_coef    = -34,    # SDMT coefficient
+  CAP_coef      =   7,    # CAP score coefficient
+  intercept     = -883,   # intercept
+  scale         = 1044    # scale parameter
+)
+
+# ==== CAP Model Published Parameters ====
+cap_params <- list(
+  intercept = 4.4196,
+  age_0 = 0.2188,       # beta * C
+  age_0_CAG = -0.0065   # beta
+)
+
+
+## apply models to ENROLL-HD with published parameters over each CV fold
+
+pubparam_models_by_fold <- vector("list", length = n_splits)
+
+for (i in 1:n_splits) {
+  
+  # training set i
+  train_data <- fitted_models_by_fold[[i]]$train_data
+  
+  # testing set i
+  test_data  <- fitted_models_by_fold[[i]]$test_data
+
+  ## --- CAP model linear predictor from published params ---
+  # Create design matrix matching the published model formula
+  CAP_lp <- with(test_data, cap_params$intercept +
+                           cap_params$age_0 * age_0 +
+                           cap_params$age_0_CAG * (CAG * age_0))
+  
+  ## --- MRS model linear predictor from published params ---
+  MRS_lp <- with(test_data,
+    mrs_params$diagconf * diagconf +
+    mrs_params$motscore * motscore +
+    mrs_params$motscore2 * motscore^2 +
+    mrs_params$scnt1 * scnt1 +
+    mrs_params$swrt1 * swrt1 +
+    mrs_params$sit1 * sit1 +
+    mrs_params$sdmt1 * sdmt1 +
+    mrs_params$CAG * CAG +
+    mrs_params$age_0 * age_0 +
+    mrs_params$motscore_CAG * CAG * motscore +
+    mrs_params$age_CAG * CAG * age_0
+  )
+  
+  ## --- PI model linear predictor from published params ---
+  PI_lp <- with(test_data,
+    pin_params$motscore_coef * motscore +
+    pin_params$sdmt1_coef * sdmt1 +
+    pin_params$CAP_coef * CAP  # ensure CAP var is defined in test_data
+  )
+  ## --- Langbehn model risk calculation from published params ---
+  risk_Langbehn <- Langbehn_cond_CDF(langbehn_params,
+                                     current_age = test_data$W_age,
+                                     time_to_diag = 5,
+                                     cag = test_data$CAG)
+  
+  # Store published parameter-based model results
+  pubparam_models_by_fold[[i]] <- list(
+    CAP_params = cap_params,
+    MRS_params = mrs_params,
+    PI_params  = pin_params,
+    Langbehn_params = langbehn_params,
+    lp_CAP = CAP_lp,
+    lp_MRS = MRS_lp,
+    lp_PI  = PI_lp,
+    lp_Langbehn = risk_Langbehn,
+    train_data = train_data,
+    test_data = test_data
+  )
+}
+
+```
+
+
 
 ## 5. Calibration Plots from 5-Fold CV
 
