@@ -564,7 +564,7 @@ for (i in 1:n_splits) {
 
   ## --- CAP model linear predictor from published params ---
   # Create design matrix matching the published model formula
-  CAP_lp <- with(test_data, cap_params$intercept +
+  CAP_lp <- -with(test_data, cap_params$intercept +
                            cap_params$age_0 * age_0 +
                            cap_params$age_0_CAG * (CAG * age_0))
   
