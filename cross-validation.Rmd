@@ -34,11 +34,7 @@ all_models_data_complete <- ENROLL %>%
   mutate(
     W_age = age_0 + W,
     motscore2 = motscore^2,
-    CAP = age_0 * (CAG - 34),
-    diagconf0 = ifelse(diagconf == 0, 1, 0),
-    diagconf1 = ifelse(diagconf == 1, 1, 0),
-    diagconf2 = ifelse(diagconf == 2, 1, 0),
-    diagconf3 = ifelse(diagconf == 3, 1, 0)
+    CAP = age_0 * (CAG - 34)
   )
 
 dim(all_models_data_complete)
@@ -96,7 +92,7 @@ for (i in 1:n_splits) {
                        data = train_data, dist = "loglogistic")
 
   # MRS model
-  MRS_model <- coxph(Surv(W, delta) ~ diagconf1 + diagconf2 + diagconf3 +
+  MRS_model <- coxph(Surv(W, delta) ~ factor(diagconf) +
                        motscore + motscore2 +
                        scnt1 + swrt1 + sit1 + sdmt1 + CAG + age_0 +
                        CAG:motscore + CAG:age_0,
@@ -151,7 +147,6 @@ colnames(langbehn_params_all) <- c("mu_intercept", "mu_scale", "mu_decay",
 
 # Show the parameter estimates across folds
 print(langbehn_params_all)
-
 ```
 
 ---
