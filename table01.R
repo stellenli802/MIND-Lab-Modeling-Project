@@ -6,8 +6,25 @@ library(knitr)
 
 
 ## data and directory definitions
-dir <- "G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models"
-enrollhd_data <- readRDS(paste0(dir, "/enrollhd_baseline_survival_data.rds"))
+ENROLL <- readRDS("G:/projects/tpgarcia/enroll-hd/02-Kyle-Comparing-Time-To-Diagnosis-Models/enrollhd_baseline_survival_data.rds") %>%
+  ungroup()
+
+enrollhd_data <- ENROLL %>%
+  filter(W != 0) %>%
+  filter(complete.cases(select(., W, delta, CAG, age_0,
+                               diagconf, motscore, scnt1, swrt1,
+                               sit1, sdmt1))) %>%
+  filter(CAG > 40 & CAG < 57) %>%
+  mutate(
+    W_age = age_0 + W,
+    motscore2 = motscore^2,
+    CAP = age_0 * (CAG - 34),
+    diagconf1 = ifelse(diagconf == 1, 1, 0),
+    diagconf2 = ifelse(diagconf == 2, 1, 0),
+    diagconf3 = ifelse(diagconf == 3, 1, 0)
+  )
+
+
 
 ## summary table via tableone with stratification by censoring status
 tab1_strat_delta <- CreateTableOne(vars = c("age_0", "motscore", "sdmt1", "diagconf",
