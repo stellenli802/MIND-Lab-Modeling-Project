@@ -34,7 +34,10 @@ all_models_data_complete <- ENROLL %>%
   mutate(
     W_age = age_0 + W,
     motscore2 = motscore^2,
-    CAP = age_0 * (CAG - 34)
+    CAP = age_0 * (CAG - 34),
+    diagconf1 = ifelse(diagconf == 1, 1, 0),
+    diagconf2 = ifelse(diagconf == 2, 1, 0),
+    diagconf3 = ifelse(diagconf == 3, 1, 0)
   )
 
 dim(all_models_data_complete)
