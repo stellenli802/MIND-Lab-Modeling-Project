@@ -596,7 +596,7 @@ pubparam_models_full_data <- list(
 )
 
 # time horizons at which Uno's C is calculated
-t_stars <- 1:3
+t_stars <- 1:8
 
 full_data_surv <- Surv(all_models_data_complete$W, all_models_data_complete$delta)
 
