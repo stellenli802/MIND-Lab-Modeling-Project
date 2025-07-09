@@ -504,7 +504,7 @@ comparison_table %>%
 
 ### Published parameter IPCW-based UNO's C
 ```{r}
-# ==== Langbehn Model Published Parameters ====
+# Langbehn Model Published Parameters
 langbehn_params <- list(
   mu_intercept    =  21.54,
   mu_scale        =  9.56,
@@ -515,7 +515,7 @@ langbehn_params <- list(
 )
 langbehn_params <- c(21.54, 9.56, 0.146, 35.55, 17.72, 0.327)
 
-# ==== MRS Model Published Parameters ====
+# MRS Model Published Parameters
 mrs_params <- list(
   age_0       = -0.282,  # baseline age
   CAG         =  0.140,  # CAG repeat length
@@ -532,7 +532,7 @@ mrs_params <- list(
   age_CAG     =  0.009   # Age × CAG interaction
 )
 
-# ==== PIN Model Published Parameters ====
+# PIN Model Published Parameters
 pin_params <- list(
   motscore_coef =  51,    # Total Motor Score coefficient
   sdmt1_coef    = -34,    # SDMT coefficient
@@ -541,20 +541,19 @@ pin_params <- list(
   scale         = 1044    # scale parameter
 )
 
-# ==== CAP Model Published Parameters ====
+# CAP Model Published Parameters
 cap_params <- list(
   intercept = 4.4196,
   age_0 = 0.2188,       # beta * C
   age_0_CAG = -0.0065   # beta
 )
 
-## --- CAP model linear predictor from published params ---
-# Create design matrix matching the published model formula
+# CAP model linear predictor from published params
 CAP_lp <- -with(all_models_data_complete, cap_params$intercept +
                          cap_params$age_0 * age_0 +
                          cap_params$age_0_CAG * (CAG * age_0))
 
-## --- MRS model linear predictor from published params ---
+# MRS model linear predictor from published params 
 MRS_lp <- with(all_models_data_complete,
   mrs_params$diagconf1 * diagconf1 +
   mrs_params$diagconf2 * diagconf2 +
@@ -571,13 +570,13 @@ MRS_lp <- with(all_models_data_complete,
   mrs_params$age_CAG * CAG * age_0
 )
 
-## --- PI model linear predictor from published params ---
+# PI model linear predictor from published params
 PI_lp <- with(all_models_data_complete,
   pin_params$motscore_coef * motscore +
   pin_params$sdmt1_coef * sdmt1 +
-  pin_params$CAP_coef * CAP  # ensure CAP var is defined in test_data
+  pin_params$CAP_coef * CAP
 )
-## --- Langbehn model risk calculation from published params ---
+# Langbehn model risk calculation from published params
 risk_Langbehn <- Langbehn_cond_CDF(langbehn_params,
                                    current_age = all_models_data_complete$W_age,
                                    time_to_diag = 5,
@@ -595,11 +594,54 @@ pubparam_models_full_data <- list(
   lp_Langbehn = risk_Langbehn
 )
 
+## Applying Kyle's custom uno's c function
+
 # time horizons at which Uno's C is calculated
 t_stars <- 1:8
 
-full_data_surv <- Surv(all_models_data_complete$W, all_models_data_complete$delta)
+# Fit KM for censoring distribution using full dataset
+test_data_pubparam <- all_models_data_complete
+km_cens <- survfit(Surv(W, 1 - delta) ~ 1, data = test_data_pubparam)
 
+G_hat_left <- function(t) {
+  s <- summary(km_cens, times = unique(c(0, km_cens$time)), extend = TRUE)
+  approx(
+    x = s$time,
+    y = s$surv,
+    xout = t - 1e-8,
+    method = "constant",
+    f = 0,
+    rule = 2
+  )$y
+}
+
+# Combine model lp vectors into a tidy format
+all_models_lp <- bind_rows(
+  tibble(model = "Langbehn", lp = risk_Langbehn),
+  tibble(model = "CAP", lp = CAP_lp),
+  tibble(model = "MRS", lp = MRS_lp),
+  tibble(model = "PIN", lp = PI_lp)
+)
+
+# Calculate Uno's C for each model and t_star
+custom_uno_results_pubparam <- all_models_lp %>%
+  group_by(model) %>%
+  group_modify(~ {
+    test_data_pubparam$lp <- .x$lp  # assign lp vector to test_data
+
+    map_dfr(t_stars, function(t_star) {
+      tibble(
+        time = t_star,
+        uno_c_custom = compute_uno_c(test_data_pubparam, G_hat_left, t_star)
+      )
+    })
+  })
+
+print(custom_uno_results_pubparam)
+```
+
+### built-in uno c functions
+```{r}
 # Time-specific Uno's C
 time_specific <- map_dfr(t_stars, function(t_star) {
   tibble(
@@ -758,6 +800,7 @@ pubparam_UnoC_summary <- pubparam_CV_UnoC_results %>%
 print(pubparam_UnoC_summary)
 
 ```
+
 
 
 ## 5. Calibration Plots from 5-Fold CV
