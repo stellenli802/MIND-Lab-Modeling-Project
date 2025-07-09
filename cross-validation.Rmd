@@ -633,6 +633,7 @@ pubparam_UnoC_all_data <- bind_rows(time_specific, global) %>%
 pubparam_UnoC_all_data_summary <- pubparam_UnoC_all_data %>%
   mutate(type = if_else(is.na(time), "Global", "Time-specific")) %>%
   select(type, time, model, UnoC) %>%
+  
   arrange(type, time, model)
 
 print(pubparam_UnoC_all_data_summary)
