@@ -272,7 +272,6 @@ xtable_UnoC <- xtable(UnoC_summary_latex,
 print(xtable_UnoC, include.rownames = FALSE, sanitize.text.function = identity)
 ```
 
-
 ```{r Uno_C_plot}
 # Compute global UnoC summaries for use in legend
 global_labels <- CV_UnoC_results %>%
@@ -677,6 +676,30 @@ UnoC_custom_summary_pubparam <- custom_uno_results_pubparam %>%
   mutate(type = "Custom") %>%
   select(type, time, model, UnoC) %>%
   arrange(model, is.na(time), time)
+
+# comparison between published parameter estimates and derived parameter estimates
+UnoC_pubparam_comparison <- custom_uno_results_pubparam %>%
+  left_join(UnoC_custom_summary, by = c("time", "model")) %>%
+  mutate(difference = uno_c_custom - mean_UnoC) %>%
+  select(model, time, uno_c_custom, difference)
+
+# Format LaTeX output
+pubparam_comparison_table <- UnoC_pubparam_comparison %>%
+  mutate(
+    time_label = ifelse(is.na(time), "Global", as.character(time)),
+    UnoC = sprintf("%.3f", uno_c_custom),
+    Difference   = sprintf("%.3f", difference),
+    UnoC_with_diff = paste0(UnoC, " (", Difference, ")")
+  ) %>%
+  select(time = time_label, model, UnoC_with_diff) %>%
+  pivot_wider(names_from = model, values_from = UnoC_with_diff)
+# Generate LaTeX table
+xtable_UnoC_comparison <- xtable(pubparam_comparison_table,
+                             caption = "Custom Uno's C statistic (and difference from derived parameter estimate) by model and evaluation time (including global) for published model parameters.",
+                             label = "tab:UnoC_custom_summary",
+                             align = c("l", "c", "c", "c", "c", "c"))
+
+print(xtable_UnoC_comparison, include.rownames = FALSE, sanitize.text.function = identity)
 
 # Format LaTeX output
 UnoC_custom_summary_pubparam_latex <- UnoC_custom_summary_pubparam %>%
